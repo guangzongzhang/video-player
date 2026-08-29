@@ -8,7 +8,7 @@ import math
 def make_icon(out_path: str = "icon.ico"):
     SIZE = 256
 
-    # ── 底层画布 ────────────────────────────────────────────────────────────
+    # ── 底层画布 ──────────────────────────────────────────────────────────────
     base = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
     draw = ImageDraw.Draw(base)
 
@@ -89,7 +89,7 @@ def make_icon(out_path: str = "icon.ico"):
     ]
     draw.polygon(hi_pts, fill=(255, 255, 255, 60))
 
-    # ─ 导出多尺寸 ICO ────────────────────────────────────────────────────────
+    # ── 导出多尺寸 ICO ────────────────────────────────────────────────────────
     sizes  = [256, 128, 64, 48, 32, 16]
     frames = []
     for s in sizes:
@@ -100,7 +100,7 @@ def make_icon(out_path: str = "icon.ico"):
         sizes=[(s, s) for s in sizes],
         append_images=frames[1:],
     )
-    print(f"图标已生成：{out_path}")
+    print(f"图标已生成: {out_path}")
 
 
 if __name__ == "__main__":

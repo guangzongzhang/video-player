@@ -1,2 +1,4 @@
 PyQt6>=6.4.0
 keyboard>=0.13.5
+
+# 打包（python build.py）额外需要：pyinstaller、Pillow（build.py 会自动安装）

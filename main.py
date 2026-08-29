@@ -27,6 +27,17 @@ Video Player  ·  PyQt6 + Qt Multimedia
   ↑ / ↓       音量 +5 / -5
   N           下一个
   B           上一个
+  [ / ]       上一个/下一个书签
+  Alt+1..9    跳转到第 1–9 个书签
+  Ctrl+F / /  搜索播放列表
+  Ctrl+S      截图
+  Ctrl+O      打开文件
+  Ctrl+Shift+O 打开文件夹
+
+全局快捷键（需安装 keyboard 包）
+  Ctrl+Alt+Space  播放 / 暂停
+  Ctrl+Alt+→      下一个
+  Ctrl+Alt+←      上一个
 """
 
 import sys
@@ -47,7 +58,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
-from PyQt6.QtCore import Qt, QTimer, QUrl, QPoint, QPointF, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QUrl, QPoint, QPointF, QObject, pyqtSignal
 from PyQt6.QtGui import (
     QKeySequence, QShortcut, QPalette, QColor, QPainter, QPolygonF,
     QPixmap, QScreen, QDragEnterEvent, QDropEvent, QIcon,
@@ -85,22 +96,40 @@ class DataManager:
     def __init__(self):
         self._path = Path.home() / ".videoplayer_data.json"
         self._data = self._load()
+        self._prune_missing()
 
     def _load(self) -> dict:
         try:
-            return json.loads(self._path.read_text(encoding="utf-8"))
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("data file is not a JSON object")
         except Exception:
-            return {
-                "last_positions": {},
-                "bookmarks": {},
-                "last_session": None,
-                "history": [],
-                "last_dir": "",
-                "prefs": {"volume": 80, "speed": "1.0x"},
-                "video_settings": {},
-                "folder_states": {},
-                "watched": {},
-            }
+            data = {}
+        # 确保所有键存在（兼容旧版本/损坏的数据文件）
+        data.setdefault("last_session", None)
+        data.setdefault("last_dir", "")
+        data.setdefault("prefs", {"volume": 80, "speed": "1.0x"})
+        for section in ("last_positions", "bookmarks", "video_settings",
+                        "watched", "folder_states"):
+            if not isinstance(data.get(section), dict):
+                data[section] = {}
+        if not isinstance(data.get("history"), list):
+            data["history"] = []
+        # 旧版本数据路径未做归一化，读取时统一迁移
+        for section in ("last_positions", "bookmarks", "video_settings", "watched"):
+            data[section] = {_normpath(k): v for k, v in data[section].items()}
+        return data
+
+    def _prune_missing(self):
+        """启动时清理已不存在（被移动/删除）的视频记录，防止数据文件无限膨胀"""
+        removed = False
+        for section in ("last_positions", "bookmarks", "video_settings", "watched"):
+            kept = {k: v for k, v in self._data[section].items() if os.path.isfile(k)}
+            if len(kept) != len(self._data[section]):
+                self._data[section] = kept
+                removed = True
+        if removed:
+            self._save()
 
     # ── 上次打开目录 ──────────────────────────────────────────────────────────
     def get_last_dir(self) -> str:
@@ -119,8 +148,6 @@ class DataManager:
         self._save()
 
     def _save(self):
-        # 确保所有键存在（兼容旧文件）
-        self._data.setdefault("history", [])
         try:
             tmp_path = self._path.with_suffix(".tmp")
             tmp_path.write_text(
@@ -128,8 +155,9 @@ class DataManager:
                 encoding="utf-8",
             )
             os.replace(tmp_path, self._path)
-        except Exception:
-            pass
+        except Exception as e:
+            # 静默吞掉会让用户在磁盘满/文件被占用时无声丢数据
+            print(f"[VideoPlayer] 数据保存失败: {e}", file=sys.stderr)
 
     # ── 最后会话 ──────────────────────────────────────────────────────────────
     def get_last_session(self) -> dict | None:
@@ -215,9 +243,44 @@ class DataManager:
         self._data["history"] = []
         self._save()
 
+    def move_history_to_top(self, idx: int):
+        history = self._data.get("history", [])
+        if 0 <= idx < len(history):
+            history.insert(0, history.pop(idx))
+            self._save()
+
+    def toggle_history_pin(self, idx: int):
+        """切换钉住状态；钉住条目始终排在未钉住条目之前"""
+        history = self._data.get("history", [])
+        if not (0 <= idx < len(history)):
+            return
+        entry = history.pop(idx)
+        entry["pinned"] = not entry.get("pinned", False)
+        if entry["pinned"]:
+            history.insert(0, entry)
+        else:
+            insert_pos = sum(1 for e in history if e.get("pinned", False))
+            history.insert(insert_pos, entry)
+        self._save()
+
+    def replace_history(self, entries: list[dict]):
+        """整体替换历史列表（用于拖拽排序后同步）"""
+        self._data["history"] = entries
+        self._save()
+
     # ── 播放位置 ──────────────────────────────────────────────────────────────
+    @staticmethod
+    def _split_pos(value) -> tuple[int, int]:
+        """进度记录兼容两种格式：旧版 int（只有位置）、新版 dict（位置+时长）"""
+        if isinstance(value, dict):
+            return value.get("pos", 0), value.get("dur", 0)
+        return value, 0
+
     def get_position(self, path: str) -> int:
-        return self._data["last_positions"].get(_normpath(path), 0)
+        return self._split_pos(self._data["last_positions"].get(_normpath(path), 0))[0]
+
+    def get_duration(self, path: str) -> int:
+        return self._split_pos(self._data["last_positions"].get(_normpath(path), 0))[1]
 
     def set_position(self, path: str, pos: int, duration: int):
         path = _normpath(path)
@@ -226,7 +289,7 @@ class DataManager:
         elif duration > 0 and pos > duration - 60_000:
             self._data["last_positions"].pop(path, None)
         else:
-            self._data["last_positions"][path] = pos
+            self._data["last_positions"][path] = {"pos": pos, "dur": duration}
         # 播放超过 90% 自动标记为已看
         if duration > 0 and pos > duration * 0.9:
             self.set_watched(path, True)
@@ -250,17 +313,20 @@ class DataManager:
         positions = self._data.get("last_positions", {})
         watched = self._data.get("watched", {})
         result = []
-        for path, pos in positions.items():
-            if not watched.get(path, False) and pos > 0:
-                result.append({"path": path, "position": pos})
+        for path, value in positions.items():
+            if watched.get(path, False):
+                continue
+            pos, dur = self._split_pos(value)
+            if pos > 0:
+                result.append({"path": path, "position": pos, "duration": dur})
         return result
 
     # ── 书签 ──────────────────────────────────────────────────────────────────
     def get_bookmarks(self, path: str) -> list[dict]:
-        return list(self._data["bookmarks"].get(path, []))
+        return list(self._data["bookmarks"].get(_normpath(path), []))
 
     def add_bookmark(self, path: str, time_ms: int, label: str) -> bool:
-        bms = self._data["bookmarks"].setdefault(path, [])
+        bms = self._data["bookmarks"].setdefault(_normpath(path), [])
         if any(abs(b["time"] - time_ms) < 1_000 for b in bms):
             return False
         bms.append({"time": time_ms, "label": label})
@@ -269,12 +335,13 @@ class DataManager:
         return True
 
     def remove_bookmark(self, path: str, time_ms: int):
-        bms = self._data["bookmarks"].get(path, [])
-        self._data["bookmarks"][path] = [b for b in bms if b["time"] != time_ms]
+        key = _normpath(path)
+        bms = self._data["bookmarks"].get(key, [])
+        self._data["bookmarks"][key] = [b for b in bms if b["time"] != time_ms]
         self._save()
 
     def clear_bookmarks(self, path: str):
-        self._data["bookmarks"].pop(path, None)
+        self._data["bookmarks"].pop(_normpath(path), None)
         self._save()
 
     # ── 每个视频独立设置 ─────────────────────────────────────────────────────────
@@ -469,6 +536,15 @@ class PlayerWindow(QMainWindow):
 
         self._dm = DataManager()
 
+        # 每视频设置延迟合并写入，避免拖音量条时高频写盘
+        self._pending_vs: dict[str, dict] = {}
+        self._vs_timer = QTimer(singleShot=True, interval=800)
+        self._vs_timer.timeout.connect(self._flush_video_settings)
+
+        # 控制栏自动隐藏倒计时（仅全屏播放时启用）
+        self._controls_timer = QTimer(singleShot=True, interval=3000)
+        self._controls_timer.timeout.connect(self._hide_controls)
+
         self.player = QMediaPlayer()
         self.audio_out = QAudioOutput()
         self.player.setAudioOutput(self.audio_out)
@@ -494,6 +570,7 @@ class PlayerWindow(QMainWindow):
 
     # ── 构建界面 ──────────────────────────────────────────────────────────────
     def _build_ui(self):
+        self._build_menubar()
         root = QWidget()
         self.setCentralWidget(root)
         rl = QHBoxLayout(root)
@@ -664,6 +741,43 @@ class PlayerWindow(QMainWindow):
         self.setStatusBar(self._status_bar)
         self._update_status_hint()
 
+    # ── 菜单栏 ────────────────────────────────────────────────────────────────
+    def _build_menubar(self):
+        """主菜单：让新用户能发现“打开文件/文件夹”等入口（不与已有 QShortcut 重复绑键）"""
+        mb = self.menuBar()
+
+        m_file = mb.addMenu("文件(&F)")
+        act_open = m_file.addAction("打开文件…")
+        act_open.triggered.connect(self.open_file)
+        act_open_dir = m_file.addAction("打开文件夹…")
+        act_open_dir.triggered.connect(self.open_folder)
+        m_file.addSeparator()
+        act_clear_pl = m_file.addAction("清空播放列表")
+        act_clear_pl.triggered.connect(self.clear_playlist)
+        m_file.addSeparator()
+        act_quit = m_file.addAction("退出")
+        act_quit.triggered.connect(self.close)
+
+        m_play = mb.addMenu("播放(&P)")
+        act_toggle = m_play.addAction("播放 / 暂停")
+        act_toggle.triggered.connect(self.toggle_play)
+        act_prev = m_play.addAction("上一个")
+        act_prev.triggered.connect(self.play_prev)
+        act_next = m_play.addAction("下一个")
+        act_next.triggered.connect(self.play_next)
+        m_play.addSeparator()
+        act_bm = m_play.addAction("添加书签")
+        act_bm.triggered.connect(self.add_bookmark)
+
+        m_view = mb.addMenu("视图(&V)")
+        act_side = m_view.addAction("显示 / 隐藏侧边栏")
+        act_side.triggered.connect(self.toggle_sidebar)
+        act_fs = m_view.addAction("全屏切换")
+        act_fs.triggered.connect(self.toggle_fullscreen)
+        m_view.addSeparator()
+        act_shot = m_view.addAction("截图")
+        act_shot.triggered.connect(self._take_screenshot)
+
     def _build_controls(self):
         w = QWidget()
         w.setFixedHeight(70)
@@ -759,10 +873,12 @@ class PlayerWindow(QMainWindow):
         sc("]",           lambda: self._jump_adjacent_bookmark(1))
         for i in range(1, 10):
             sc(f"Alt+{i}", lambda n=i: self._jump_to_bookmark(n - 1))
-        # 搜索 / 截图
+        # 搜索 / 截图 / 打开
         sc("Ctrl+F",      self._toggle_search)
         sc("/",           self._toggle_search)
         sc("Ctrl+S",      self._take_screenshot)
+        sc("Ctrl+O",      self.open_file)
+        sc("Ctrl+Shift+O", self.open_folder)
 
     # ── 信号连接 ──────────────────────────────────────────────────────────────
     def _wire_signals(self):
@@ -770,9 +886,7 @@ class PlayerWindow(QMainWindow):
         self.btn_prev.clicked.connect(self.play_prev)
         self.btn_next.clicked.connect(self.play_next)
         self.seek_slider.sliderMoved.connect(self._seek_abs)
-        self.vol_slider.valueChanged.connect(
-            lambda v: self.audio_out.setVolume(v / 100.0)
-        )
+        # 音量变化统一由 _on_vol_changed 处理（设音量 + 保存），不再重复连接
         self.speed_box.currentTextChanged.connect(self._on_speed_changed)
         self.vol_slider.valueChanged.connect(self._on_vol_changed)
         self.tree.itemExpanded.connect(self._on_tree_expand)
@@ -889,6 +1003,7 @@ class PlayerWindow(QMainWindow):
         file_ico = self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
         added_paths: list[str] = []
         for p in paths:
+            p = _normpath(p)
             if p in self.playlist:
                 continue
             self.playlist.append(p)
@@ -937,12 +1052,13 @@ class PlayerWindow(QMainWindow):
                     parent_item.removeChild(it)
             elif e.is_file():
                 if os.path.splitext(e.name)[1].lower() in VIDEO_EXT:
+                    p = _normpath(e.path)   # 与 _scan_dir 保持一致的路径格式
                     it = QTreeWidgetItem([e.name])
                     it.setIcon(0, file_ico)
-                    it.setData(0, Qt.ItemDataRole.UserRole, e.path)
+                    it.setData(0, Qt.ItemDataRole.UserRole, p)
                     parent_item.addChild(it)
-                    if e.path not in self.playlist:
-                        self.playlist.append(e.path)
+                    if p not in self.playlist:
+                        self.playlist.append(p)
 
     def clear_playlist(self):
         """清空播放列表和树"""
@@ -1272,7 +1388,7 @@ class PlayerWindow(QMainWindow):
             bar.setRange(0, 100)
             bar.setFixedWidth(80)
             bar.setEnabled(False)
-            pct = self._estimate_progress(path, pos)
+            pct = self._estimate_progress(pos, entry.get("duration", 0))
             bar.setValue(pct)
             bar.setStyleSheet(self._slider_css("#0d6efd"))
             hl.addWidget(bar)
@@ -1287,13 +1403,12 @@ class PlayerWindow(QMainWindow):
             self.cw_list.addItem(list_item)
             self.cw_list.setItemWidget(list_item, widget)
 
-    def _estimate_progress(self, path: str, pos: int) -> int:
-        """估算播放进度百分比"""
-        if pos <= 0:
-            return 0
+    @staticmethod
+    def _estimate_progress(pos: int, duration: int) -> int:
+        """播放进度百分比：优先用真实时长；旧数据缺时长时按位置粗略估算"""
+        if duration > 0:
+            return min(99, max(1, int(pos / duration * 100)))
         minutes = pos / 60_000
-        if minutes > 60:
-            return min(95, int(pos / (pos + 300_000) * 100))
         return min(95, max(1, int(minutes / 2 * 100)))
 
     def _on_cw_dbl_click(self, item: QListWidgetItem):
@@ -1539,31 +1654,13 @@ class PlayerWindow(QMainWindow):
     def _hist_move_to_top(self, item: QListWidgetItem):
         """将历史条目移到最顶部（置顶）"""
         row = self.hist_list.row(item)
-        if row <= 0:
-            return
-        history = self._dm._data.get("history", [])
-        if 0 <= row < len(history):
-            history.insert(0, history.pop(row))
-            self._dm._save()
+        if row > 0:
+            self._dm.move_history_to_top(row)
             self._refresh_hist_list()
 
     def _hist_toggle_pin(self, item: QListWidgetItem):
         """切换历史条目的钉住状态"""
-        row = self.hist_list.row(item)
-        history = self._dm._data.get("history", [])
-        if not (0 <= row < len(history)):
-            return
-        was_pinned = history[row].get("pinned", False)
-        history[row]["pinned"] = not was_pinned
-        entry = history.pop(row)
-        if not was_pinned:
-            # 钉住：移到钉住区最前面
-            history.insert(0, entry)
-        else:
-            # 取消钉住：移到所有钉住条目之后
-            insert_pos = sum(1 for e in history if e.get("pinned", False))
-            history.insert(insert_pos, entry)
-        self._dm._save()
+        self._dm.toggle_history_pin(self.hist_list.row(item))
         self._refresh_hist_list()
 
     # ── 播放列表拖拽排序 / 文件夹重命名 ──────────────────────────────────────
@@ -1712,13 +1809,9 @@ class PlayerWindow(QMainWindow):
 
     def _on_hist_reordered(self):
         """历史列表拖拽排序后同步到 DataManager"""
-        history = []
-        for i in range(self.hist_list.count()):
-            entry = self.hist_list.item(i).data(Qt.ItemDataRole.UserRole)
-            if entry:
-                history.append(entry)
-        self._dm._data["history"] = history
-        self._dm._save()
+        entries = [self.hist_list.item(i).data(Qt.ItemDataRole.UserRole)
+                   for i in range(self.hist_list.count())]
+        self._dm.replace_history([e for e in entries if e])
 
     # ── 视频区域右键菜单（设置）──────────────────────────────────────────────
     def _show_video_menu(self, pos: QPoint):
@@ -1825,9 +1918,14 @@ class PlayerWindow(QMainWindow):
 
     # ── 播放器回调 ────────────────────────────────────────────────────────────
     def _on_state_changed(self, state):
-        self.btn_play.setText(
-            "⏸" if state == QMediaPlayer.PlaybackState.PlayingState else "▶"
-        )
+        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        self.btn_play.setText("⏸" if playing else "▶")
+        if playing:
+            self._arm_controls_timer()
+        else:
+            self._controls_timer.stop()
+            if not self._controls_visible:
+                self._show_controls()
 
     def _on_duration_changed(self, dur: int):
         self.lbl_dur.setText(self._fmt_time(dur))
@@ -1884,6 +1982,7 @@ class PlayerWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._save_current_position()
+        self._flush_video_settings()
         self._dm.set_prefs(self.vol_slider.value(), self.speed_box.currentText())
         self._save_session_from_tree()   # 保存文件夹展开状态
         self._tray_mgr.cleanup()
@@ -1917,10 +2016,19 @@ class PlayerWindow(QMainWindow):
 
     def _on_vol_changed(self, value: int):
         self.audio_out.setVolume(value / 100.0)
-        # 保存独立设置
+        # 保存独立设置（延迟合并写入，避免拖动时高频写盘）
         if self.current_index >= 0:
-            self._dm.set_video_settings(
-                self.playlist[self.current_index], volume=value)
+            self._defer_video_settings(volume=value)
+
+    def _defer_video_settings(self, **kwargs):
+        path = self.playlist[self.current_index]
+        self._pending_vs.setdefault(path, {}).update(kwargs)
+        self._vs_timer.start()
+
+    def _flush_video_settings(self):
+        for path, kw in self._pending_vs.items():
+            self._dm.set_video_settings(path, **kw)
+        self._pending_vs = {}
 
     # ── 文件夹展开状态持久化 ────────────────────────────────────────────────────
     def _on_tree_expand(self, item: QTreeWidgetItem):
@@ -1961,26 +2069,43 @@ class PlayerWindow(QMainWindow):
                 if result is not None:
                     return result
             return None
-        return search(self.tree.invisibleRootItem()) or -1
+        result = search(self.tree.invisibleRootItem())
+        # 不能写 `result or -1`：第一项匹配时返回 0，会被误判成 -1
+        return result if result is not None else -1
 
     # ── 控制栏自动隐藏 ──────────────────────────────────────────────────────────
     def _on_video_mouse_move(self, local_pos: QPoint):
         """VideoWidget 转发鼠标移动事件，用于控制栏自动隐藏"""
         if not self._controls_visible:
             self._show_controls()
+        else:
+            self._arm_controls_timer()
+
+    def _arm_controls_timer(self):
+        """仅全屏播放时才启动自动隐藏倒计时"""
+        if (self.isFullScreen()
+                and self.player.playbackState()
+                    == QMediaPlayer.PlaybackState.PlayingState):
+            self._controls_timer.start()
 
     def _show_controls(self):
         self._controls_visible = True
         controls_bar = self._get_controls_bar()
         if controls_bar:
             controls_bar.show()
+        self._arm_controls_timer()
 
     def _hide_controls(self):
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self._controls_visible = False
-            controls_bar = self._get_controls_bar()
-            if controls_bar:
-                controls_bar.hide()
+        if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            return
+        controls_bar = self._get_controls_bar()
+        if controls_bar is None:
+            return
+        if controls_bar.underMouse():
+            self._controls_timer.start()   # 鼠标还停在控制栏上，稍后再隐藏
+            return
+        self._controls_visible = False
+        controls_bar.hide()
 
     def _get_controls_bar(self) -> QWidget | None:
         """获取控制栏 widget（content layout 的第二个 widget）"""
@@ -2197,15 +2322,32 @@ class PlayerWindow(QMainWindow):
 
 
 # ── 系统托盘 + 全局快捷键 ─────────────────────────────────────────────────────
-class TrayManager:
+class TrayManager(QObject):
     """系统托盘图标 + 全局快捷键管理"""
 
+    # keyboard 库在其自己的后台线程里回调，Qt 禁止跨线程操作控件，
+    # 因此回调只 emit 信号，由队列连接把实际 GUI 操作转回主线程执行
+    hotkey_cmd = pyqtSignal(str)
+
+    _COMMANDS = {
+        "toggle": "toggle_play",
+        "next":   "play_next",
+        "prev":   "play_prev",
+    }
+
     def __init__(self, window: PlayerWindow):
+        super().__init__()
         self._win = window
         self._tray: QSystemTrayIcon | None = None
         self._hotkeys: list[str] = []
+        self.hotkey_cmd.connect(self._dispatch_command)
         self._build_tray()
         self._register_hotkeys()
+
+    def _dispatch_command(self, cmd: str):
+        fn = getattr(self._win, self._COMMANDS.get(cmd, ""), None)
+        if fn:
+            fn()
 
     def _build_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -2255,14 +2397,17 @@ class TrayManager:
         if not HAS_KEYBOARD:
             return
         try:
-            keyboard.add_hotkey("ctrl+alt+space", self._win.toggle_play)
-            self._hotkeys.append("ctrl+alt+space")
-            keyboard.add_hotkey("ctrl+alt+right", self._win.play_next)
-            self._hotkeys.append("ctrl+alt+right")
-            keyboard.add_hotkey("ctrl+alt+left", self._win.play_prev)
-            self._hotkeys.append("ctrl+alt+left")
-        except Exception:
-            pass
+            self._hotkeys.append(
+                keyboard.add_hotkey("ctrl+alt+space",
+                                    lambda: self.hotkey_cmd.emit("toggle")))
+            self._hotkeys.append(
+                keyboard.add_hotkey("ctrl+alt+right",
+                                    lambda: self.hotkey_cmd.emit("next")))
+            self._hotkeys.append(
+                keyboard.add_hotkey("ctrl+alt+left",
+                                    lambda: self.hotkey_cmd.emit("prev")))
+        except Exception as e:
+            print(f"[VideoPlayer] 全局快捷键注册失败: {e}", file=sys.stderr)
 
     def on_minimize(self):
         """最小化时隐藏到托盘"""
