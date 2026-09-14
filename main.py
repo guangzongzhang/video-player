@@ -104,6 +104,13 @@ class DataManager:
             if not isinstance(data, dict):
                 raise ValueError("data file is not a JSON object")
         except Exception:
+            # 数据文件损坏时备份后重新开始，避免无声丢数据
+            if self._path.exists():
+                backup = self._path.with_suffix(".json.bak")
+                try:
+                    backup.write_bytes(self._path.read_bytes())
+                except Exception:
+                    pass
             data = {}
         # 确保所有键存在（兼容旧版本/损坏的数据文件）
         data.setdefault("last_session", None)
@@ -115,20 +122,52 @@ class DataManager:
                 data[section] = {}
         if not isinstance(data.get("history"), list):
             data["history"] = []
+        if not isinstance(data.get("_missing_counts"), dict):
+            data["_missing_counts"] = {}
         # 旧版本数据路径未做归一化，读取时统一迁移
         for section in ("last_positions", "bookmarks", "video_settings", "watched"):
             data[section] = {_normpath(k): v for k, v in data[section].items()}
+        if isinstance(data.get("_missing_counts"), dict):
+            data["_missing_counts"] = {
+                _normpath(k): v for k, v in data["_missing_counts"].items()
+            }
         return data
 
+    # 连续缺失多少次启动后才清理（给 USB/网络盘重连的宽限）
+    _MISSING_GRACE = 5
+
     def _prune_missing(self):
-        """启动时清理已不存在（被移动/删除）的视频记录，防止数据文件无限膨胀"""
+        """启动时清理已不存在（被移动/删除）的视频记录。
+
+        使用宽限期策略：连续多次启动仍找不到文件才删除，
+        避免 USB 断开/网络盘未挂载时误删记录。
+        """
+        missing_counts: dict = self._data.setdefault("_missing_counts", {})
         removed = False
+        changed = False
+
+        all_paths: set[str] = set()
         for section in ("last_positions", "bookmarks", "video_settings", "watched"):
-            kept = {k: v for k, v in self._data[section].items() if os.path.isfile(k)}
-            if len(kept) != len(self._data[section]):
-                self._data[section] = kept
-                removed = True
-        if removed:
+            all_paths.update(self._data[section].keys())
+
+        for path in all_paths:
+            if os.path.isfile(path):
+                if path in missing_counts:
+                    missing_counts.pop(path, None)
+                    changed = True
+            else:
+                count = missing_counts.get(path, 0) + 1
+                missing_counts[path] = count
+                changed = True
+                if count >= self._MISSING_GRACE:
+                    # 连续多次缺失，清理记录
+                    for section in ("last_positions", "bookmarks",
+                                    "video_settings", "watched"):
+                        self._data[section].pop(path, None)
+                    missing_counts.pop(path, None)
+                    removed = True
+
+        if removed or changed:
             self._save()
 
     # ── 上次打开目录 ──────────────────────────────────────────────────────────
@@ -286,7 +325,8 @@ class DataManager:
         path = _normpath(path)
         if pos < 5_000:
             self._data["last_positions"].pop(path, None)
-        elif duration > 0 and pos > duration - 60_000:
+        elif duration > 0 and pos >= duration * 0.95:
+            # 接近结尾（95%），视为看完，移除进度记录
             self._data["last_positions"].pop(path, None)
         else:
             self._data["last_positions"][path] = {"pos": pos, "dur": duration}
@@ -309,13 +349,15 @@ class DataManager:
         self._save()
 
     def get_continue_watching(self) -> list[dict]:
-        """返回有播放进度但未标记为已看的视频列表"""
+        """返回有播放进度但未标记为已看的视频列表（仅当前存在的文件）"""
         positions = self._data.get("last_positions", {})
         watched = self._data.get("watched", {})
         result = []
         for path, value in positions.items():
             if watched.get(path, False):
                 continue
+            if not os.path.isfile(path):
+                continue   # 文件暂时不存在（USB/网络盘），跳过显示但保留记录
             pos, dur = self._split_pos(value)
             if pos > 0:
                 result.append({"path": path, "position": pos, "duration": dur})
@@ -346,9 +388,10 @@ class DataManager:
 
     # ── 每个视频独立设置 ─────────────────────────────────────────────────────────
     def get_video_settings(self, path: str) -> dict:
-        return self._data.get("video_settings", {}).get(path, {})
+        return self._data.get("video_settings", {}).get(_normpath(path), {})
 
     def set_video_settings(self, path: str, speed: str = None, volume: int = None):
+        path = _normpath(path)
         vs = self._data.setdefault("video_settings", {})
         settings = vs.get(path, {})
         if speed is not None:
@@ -1300,7 +1343,7 @@ class PlayerWindow(QMainWindow):
         label = label.strip() or default_label
         if self._dm.add_bookmark(path, pos, label):
             self._refresh_bm_list()
-            self.tab_widget.setCurrentIndex(1)
+            self.tab_widget.setCurrentIndex(2)   # 切换到"书签"Tab
 
     def clear_bookmarks(self):
         if self.current_index < 0:
@@ -1376,12 +1419,15 @@ class PlayerWindow(QMainWindow):
             pos = entry["position"]
             name = os.path.basename(path)
             widget = QWidget()
+            widget.setToolTip(path)
             hl = QHBoxLayout(widget)
             hl.setContentsMargins(8, 4, 8, 4)
             hl.setSpacing(8)
             lbl_name = QLabel(name)
             lbl_name.setStyleSheet("color:#ccc;font-size:13px;font-family:'Microsoft YaHei','SimSun',sans-serif;")
             lbl_name.setFont(QFont("Microsoft YaHei", 13))
+            lbl_name.setWordWrap(True)
+            lbl_name.setToolTip(name)
             lbl_name.setMinimumWidth(0)
             hl.addWidget(lbl_name, stretch=1)
             bar = QSlider(Qt.Orientation.Horizontal)
@@ -1399,9 +1445,25 @@ class PlayerWindow(QMainWindow):
             hl.addWidget(lbl_pct)
             list_item = QListWidgetItem()
             list_item.setData(Qt.ItemDataRole.UserRole, path)
-            list_item.setSizeHint(widget.sizeHint())
+            hint = widget.sizeHint()
+            hint.setHeight(max(hint.height(), 44))
+            list_item.setSizeHint(hint)
             self.cw_list.addItem(list_item)
             self.cw_list.setItemWidget(list_item, widget)
+        QTimer.singleShot(0, self._adjust_cw_item_heights)
+
+    def _adjust_cw_item_heights(self):
+        """布局完成后根据实际 widget 高度更新继续观看列表项高度"""
+        for i in range(self.cw_list.count()):
+            item = self.cw_list.item(i)
+            widget = self.cw_list.itemWidget(item)
+            if widget is None:
+                continue
+            hint = item.sizeHint()
+            new_h = widget.sizeHint().height()
+            if new_h > 0 and new_h != hint.height():
+                hint.setHeight(new_h)
+                item.setSizeHint(hint)
 
     @staticmethod
     def _estimate_progress(pos: int, duration: int) -> int:
