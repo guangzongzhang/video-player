@@ -699,10 +699,6 @@ class PlayerWindow(QMainWindow):
         self.player.setAudioOutput(self.audio_out)
         self.audio_out.setVolume(0.8)
 
-        # 视频输出 + sink（用于截图、字幕等）
-        self.video_sink = QVideoSink()
-        self.player.setVideoSink(self.video_sink)
-
         self._build_ui()
         self._build_shortcuts()
         self._wire_signals()
@@ -874,8 +870,9 @@ class PlayerWindow(QMainWindow):
         self.video = VideoWidget()
         self.video.setStyleSheet("background:#000000;")
         self.video.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        # 使用共享 sink：player 输出到 sink，widget 从 sink 显示
-        self.video.setVideoSink(self.video_sink)
+        # player 输出到 widget，再取 widget 内部的 sink 用于截图
+        self.player.setVideoOutput(self.video)
+        self.video_sink = self.video.videoSink()
         cl.addWidget(self.video, stretch=1)
         cl.addWidget(self._build_controls())
 
