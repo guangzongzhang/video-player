@@ -4,7 +4,7 @@ Video Player  ·  PyQt6 + Qt Multimedia
 ========================================
 功能：
   · 打开单个/多个视频文件，或整个文件夹
-  · 目录树逐层展开/折叠，双击播放
+  · 目录树逐层展开/折叠（懒加载，大文件夹不卡顿），双击播放
   · 播放/暂停/上一个/下一个
   · 进度条点击/拖拽定位
   · 播放速度选择 (0.25× – 3.0×)
@@ -14,7 +14,12 @@ Video Player  ·  PyQt6 + Qt Multimedia
   · 书签：M键 添加，单击跳转，右键删除
   · 自动记忆并恢复每个视频的最后播放位置
   · 历史记录：所有加载过的文件/文件夹，双击恢复
-  · 视频区域右键菜单：速度/循环/全屏/书签等设置
+  · 视频区域右键菜单：速度/循环/全屏/书签/字幕/音轨等设置
+  · 字幕支持：自动加载同名字幕（SRT/VTT），可手动加载
+  · 截图：Ctrl+S 选择保存路径，Ctrl+Shift+S 快速保存
+  · 鼠标滚轮快进/快退，Ctrl+G 跳转指定时间
+  · 多音轨切换、M3U 播放列表导入/导出
+  · 命令行参数支持（"打开方式"直接播放）
 
 快捷键
   Space       播放 / 暂停
@@ -27,10 +32,15 @@ Video Player  ·  PyQt6 + Qt Multimedia
   ↑ / ↓       音量 +5 / -5
   N           下一个
   B           上一个
+  滚轮        快进 / 快退 5 秒
   [ / ]       上一个/下一个书签
   Alt+1..9    跳转到第 1–9 个书签
   Ctrl+F / /  搜索播放列表
+  Ctrl+G      跳转到指定时间
+  Ctrl+L      显示 / 隐藏字幕
+  Ctrl+Shift+L 加载字幕文件
   Ctrl+S      截图
+  Ctrl+Shift+S 快速截图
   Ctrl+O      打开文件
   Ctrl+Shift+O 打开文件夹
 
@@ -43,6 +53,7 @@ Video Player  ·  PyQt6 + Qt Multimedia
 import sys
 import os
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -55,13 +66,15 @@ from PyQt6.QtWidgets import (
     QTabWidget, QListWidget, QListWidgetItem,
     QInputDialog, QMenu, QAbstractItemView,
     QLineEdit, QSystemTrayIcon,
+    QMessageBox, QDialog, QDialogButtonBox, QFormLayout,
+    QCheckBox,
 )
-from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame
 from PyQt6.QtMultimediaWidgets import QVideoWidget
-from PyQt6.QtCore import Qt, QTimer, QUrl, QPoint, QPointF, QObject, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QUrl, QPoint, QPointF, QObject, pyqtSignal, QRect
 from PyQt6.QtGui import (
     QKeySequence, QShortcut, QPalette, QColor, QPainter, QPolygonF,
-    QPixmap, QScreen, QDragEnterEvent, QDropEvent, QIcon,
+    QPixmap, QScreen, QDragEnterEvent, QDropEvent, QIcon, QImage,
 )
 
 # 可选依赖：keyboard（全局快捷键）
@@ -72,6 +85,7 @@ except ImportError:
     HAS_KEYBOARD = False
 
 
+VERSION = "1.2.0"
 VIDEO_EXT = {
     ".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm",
     ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".mts", ".vob",
@@ -85,6 +99,83 @@ _PINNED_ROLE = Qt.ItemDataRole.UserRole + 1        # 自定义角色：节点是
 def _normpath(p: str) -> str:
     """规范化路径：统一使用反斜杠，确保路径匹配一致"""
     return os.path.normpath(p) if p else p
+
+
+# ── 字幕解析 ───────────────────────────────────────────────────────────────────
+SUBTITLE_EXT = {".srt", ".vtt", ".ass", ".ssa"}
+
+
+def _srt_time_to_ms(t: str) -> int:
+    """将 SRT 时间戳 'HH:MM:SS,mmm' 或 VTT 'HH:MM:SS.mmm' 转为毫秒"""
+    t = t.strip().replace(",", ".")
+    parts = t.split(":")
+    h = int(parts[0])
+    m = int(parts[1])
+    s_ms = parts[2].split(".")
+    s = int(s_ms[0])
+    ms = int(s_ms[1]) if len(s_ms) > 1 else 0
+    return h * 3_600_000 + m * 60_000 + s * 1000 + ms
+
+
+def parse_subtitle(path: str) -> list[tuple[int, int, str]]:
+    """解析 SRT / VTT 字幕文件，返回 [(start_ms, end_ms, text), ...]"""
+    try:
+        raw = Path(path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    # 统一换行
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    # 移除 VTT 文件头
+    if raw.startswith("WEBVTT"):
+        raw = raw.split("\n", 1)[1] if "\n" in raw else ""
+
+    cues: list[tuple[int, int, str]] = []
+    # 按空行分块
+    blocks = re.split(r"\n\s*\n", raw.strip())
+    time_re = re.compile(
+        r"(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})"
+    )
+    for block in blocks:
+        lines = block.split("\n")
+        # 跳过纯序号行
+        idx = 0
+        if idx < len(lines) and lines[idx].strip().isdigit():
+            idx += 1
+        if idx >= len(lines):
+            continue
+        m = time_re.search(lines[idx])
+        if not m:
+            continue
+        start = _srt_time_to_ms(m.group(1))
+        end = _srt_time_to_ms(m.group(2))
+        text = "\n".join(lines[idx + 1:]).strip()
+        # 去除简单的 HTML/ASS 标签
+        text = re.sub(r"<[^>]+>", "", text)
+        if text:
+            cues.append((start, end, text))
+    return cues
+
+
+class SubtitleLabel(QLabel):
+    """视频底部居中的字幕叠层"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
+        self.setStyleSheet(
+            "color: #ffffff; font-size: 22px; font-weight: bold;"
+            " background: transparent; padding: 0 12px 24px 12px;"
+            " font-family: 'Microsoft YaHei','SimHei',sans-serif;"
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.hide()
+
+    def set_subtitle(self, text: str):
+        if text:
+            self.setText(text)
+            self.show()
+        else:
+            self.hide()
 
 
 # ── 数据持久化 ─────────────────────────────────────────────────────────────────
@@ -531,7 +622,7 @@ class OSDLabel(QLabel):
 
 # ── 自定义视频控件 ────────────────────────────────────────────────────────────
 class VideoWidget(QVideoWidget):
-    """双击切换全屏；转发鼠标/拖放事件给主窗口"""
+    """双击切换全屏；转发鼠标/拖放/滚轮事件给主窗口"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -549,6 +640,12 @@ class VideoWidget(QVideoWidget):
             w._on_video_mouse_move(event.position().toPoint())
         super().mouseMoveEvent(event)
 
+    def wheelEvent(self, event):
+        w = self.window()
+        if hasattr(w, '_on_video_wheel'):
+            w._on_video_wheel(event.angleDelta().y())
+        # 不调用 super().wheelEvent，避免 Qt 内部处理
+
     def dragEnterEvent(self, event: QDragEnterEvent):
         self.window().dragEnterEvent(event)
 
@@ -563,7 +660,7 @@ class VideoWidget(QVideoWidget):
 class PlayerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Video Player")
+        self.setWindowTitle(f"Video Player  v{VERSION}")
         self.resize(1280, 720)
         self.setMinimumSize(800, 500)
         self.setAcceptDrops(True)
@@ -576,6 +673,15 @@ class PlayerWindow(QMainWindow):
         self._loop_mode = 0          # 0=不循环 1=单曲 2=列表
         self._controls_visible = True
         self._was_sidebar_visible = True
+
+        # 字幕
+        self._subtitles: list[tuple[int, int, str]] = []
+        self._subtitle_path: str | None = None
+        self._subtitles_enabled = True
+
+        # 自动保存 dirty-flag（减少磁盘写入）
+        self._pos_dirty = False
+        self._prefs_dirty = False
 
         self._dm = DataManager()
 
@@ -592,6 +698,10 @@ class PlayerWindow(QMainWindow):
         self.audio_out = QAudioOutput()
         self.player.setAudioOutput(self.audio_out)
         self.audio_out.setVolume(0.8)
+
+        # 视频输出 + sink（用于截图、字幕等）
+        self.video_sink = QVideoSink()
+        self.player.setVideoSink(self.video_sink)
 
         self._build_ui()
         self._build_shortcuts()
@@ -764,9 +874,15 @@ class PlayerWindow(QMainWindow):
         self.video = VideoWidget()
         self.video.setStyleSheet("background:#000000;")
         self.video.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.player.setVideoOutput(self.video)
+        # 使用共享 sink：player 输出到 sink，widget 从 sink 显示
+        self.video.setVideoSink(self.video_sink)
         cl.addWidget(self.video, stretch=1)
         cl.addWidget(self._build_controls())
+
+        # 字幕叠层（视频底部居中）
+        self._subtitle_label = SubtitleLabel(content)
+        self._subtitle_label.setGeometry(content.rect())
+        self._subtitle_label.raise_()
 
         # OSD 叠层提示
         self._osd = OSDLabel(content)
@@ -820,6 +936,12 @@ class PlayerWindow(QMainWindow):
         m_view.addSeparator()
         act_shot = m_view.addAction("截图")
         act_shot.triggered.connect(self._take_screenshot)
+
+        m_help = mb.addMenu("帮助(&H)")
+        act_about = m_help.addAction("关于")
+        act_about.triggered.connect(self._show_about)
+        act_shortcuts = m_help.addAction("快捷键说明")
+        act_shortcuts.triggered.connect(self._show_shortcuts_help)
 
     def _build_controls(self):
         w = QWidget()
@@ -898,30 +1020,44 @@ class PlayerWindow(QMainWindow):
         def sc(key, fn):
             QShortcut(QKeySequence(key), self, activated=fn)
 
-        sc("Space",       self.toggle_play)
-        sc("M",           self.add_bookmark)
+        def sc_focus_aware(key, fn):
+            """搜索框聚焦时不触发（避免输入字符触发播放控制）"""
+            def wrapper():
+                if self._search_box.hasFocus():
+                    return
+                fn()
+            QShortcut(QKeySequence(key), self, activated=wrapper)
+
+        sc_focus_aware("Space",       self.toggle_play)
+        sc_focus_aware("M",           self.add_bookmark)
         sc("P",           self.toggle_sidebar)
-        sc("F",           self.toggle_fullscreen)
+        sc_focus_aware("F",           self.toggle_fullscreen)
         sc("Escape",      self._exit_fullscreen)
-        sc("N",           self.play_next)
-        sc("B",           self.play_prev)
-        sc("Right",       lambda: self._seek_rel(5_000))
-        sc("Left",        lambda: self._seek_rel(-5_000))
-        sc("Shift+Right", lambda: self._seek_rel(30_000))
-        sc("Shift+Left",  lambda: self._seek_rel(-30_000))
-        sc("Up",          lambda: self._vol_delta(5))
-        sc("Down",        lambda: self._vol_delta(-5))
+        sc_focus_aware("N",           self.play_next)
+        sc_focus_aware("B",           self.play_prev)
+        sc_focus_aware("Right",       lambda: self._seek_rel(5_000))
+        sc_focus_aware("Left",        lambda: self._seek_rel(-5_000))
+        sc_focus_aware("Shift+Right", lambda: self._seek_rel(30_000))
+        sc_focus_aware("Shift+Left",  lambda: self._seek_rel(-30_000))
+        sc_focus_aware("Up",          lambda: self._vol_delta(5))
+        sc_focus_aware("Down",        lambda: self._vol_delta(-5))
         # 书签跳转
-        sc("[",           lambda: self._jump_adjacent_bookmark(-1))
-        sc("]",           lambda: self._jump_adjacent_bookmark(1))
+        sc_focus_aware("[",           lambda: self._jump_adjacent_bookmark(-1))
+        sc_focus_aware("]",           lambda: self._jump_adjacent_bookmark(1))
         for i in range(1, 10):
             sc(f"Alt+{i}", lambda n=i: self._jump_to_bookmark(n - 1))
         # 搜索 / 截图 / 打开
         sc("Ctrl+F",      self._toggle_search)
         sc("/",           self._toggle_search)
         sc("Ctrl+S",      self._take_screenshot)
+        sc("Ctrl+Shift+S", self._quick_screenshot)
         sc("Ctrl+O",      self.open_file)
         sc("Ctrl+Shift+O", self.open_folder)
+        # 跳转指定时间
+        sc("Ctrl+G",      self._jump_to_time)
+        # 字幕
+        sc("Ctrl+L",      self._toggle_subtitles)
+        sc("Ctrl+Shift+L", self._load_subtitle_file)
 
     # ── 信号连接 ──────────────────────────────────────────────────────────────
     def _wire_signals(self):
@@ -944,6 +1080,7 @@ class PlayerWindow(QMainWindow):
         self.player.playbackStateChanged.connect(self._on_state_changed)
         self.player.durationChanged.connect(self._on_duration_changed)
         self.player.mediaStatusChanged.connect(self._on_media_status)
+        self.player.errorOccurred.connect(self._on_player_error)
 
     # ── 打开文件 / 文件夹 ──────────────────────────────────────────────────────
     def open_file(self):
@@ -1000,6 +1137,7 @@ class PlayerWindow(QMainWindow):
         root_it = QTreeWidgetItem([os.path.basename(folder)])
         root_it.setIcon(0, dir_ico)
         root_it.setData(0, Qt.ItemDataRole.UserRole, folder)   # 存文件夹路径
+        root_it.setData(0, self._LOADED_ROLE, True)            # 根已加载
         self.tree.addTopLevelItem(root_it)
         self._scan_dir(folder, root_it, dir_ico, file_ico)
         root_it.setExpanded(True)
@@ -1074,7 +1212,7 @@ class PlayerWindow(QMainWindow):
                 self._dm.append_session_source({"type": "folder", "path": folder})
 
     def _scan_dir_append(self, path, parent_item, dir_ico, file_ico, _depth=0):
-        """递归扫描并追加；已在 playlist 的文件只建树节点、不重复加入列表"""
+        """懒加载追加扫描：只扫描当前目录，子目录放占位项"""
         if _depth > 64:
             return
         try:
@@ -1088,14 +1226,15 @@ class PlayerWindow(QMainWindow):
             if e.is_dir() and not e.is_symlink():
                 it = QTreeWidgetItem([e.name])
                 it.setIcon(0, dir_ico)
-                it.setData(0, Qt.ItemDataRole.UserRole, None)
+                it.setData(0, Qt.ItemDataRole.UserRole, _normpath(e.path))
+                it.setData(0, self._LOADED_ROLE, False)
+                placeholder = QTreeWidgetItem([""])
+                placeholder.setHidden(True)
+                it.addChild(placeholder)
                 parent_item.addChild(it)
-                self._scan_dir_append(e.path, it, dir_ico, file_ico, _depth + 1)
-                if it.childCount() == 0:
-                    parent_item.removeChild(it)
             elif e.is_file():
                 if os.path.splitext(e.name)[1].lower() in VIDEO_EXT:
-                    p = _normpath(e.path)   # 与 _scan_dir 保持一致的路径格式
+                    p = _normpath(e.path)
                     it = QTreeWidgetItem([e.name])
                     it.setIcon(0, file_ico)
                     it.setData(0, Qt.ItemDataRole.UserRole, p)
@@ -1179,6 +1318,7 @@ class PlayerWindow(QMainWindow):
                 root_it.setIcon(0, dir_ico)
                 root_it.setData(0, Qt.ItemDataRole.UserRole, folder)  # 存文件夹路径
                 root_it.setData(0, _PINNED_ROLE, is_pinned)
+                root_it.setData(0, self._LOADED_ROLE, True)            # 根已加载
                 self.tree.addTopLevelItem(root_it)
                 self._scan_dir(folder, root_it, dir_ico, file_ico)
                 root_it.setExpanded(src.get("expanded", False))
@@ -1197,7 +1337,10 @@ class PlayerWindow(QMainWindow):
         if self.playlist:
             self._prepare(min(index, len(self.playlist) - 1))
 
+    _LOADED_ROLE = Qt.ItemDataRole.UserRole + 2   # 标记文件夹是否已懒加载
+
     def _scan_dir(self, path, parent_item, dir_ico, file_ico, _depth=0):
+        """懒加载扫描：只扫描当前目录，子目录放占位项，展开时再加载"""
         if _depth > 64:
             return
         try:
@@ -1211,11 +1354,14 @@ class PlayerWindow(QMainWindow):
             if e.is_dir() and not e.is_symlink():
                 it = QTreeWidgetItem([e.name])
                 it.setIcon(0, dir_ico)
-                it.setData(0, Qt.ItemDataRole.UserRole, None)
+                # 存子目录路径，展开时按需加载
+                it.setData(0, Qt.ItemDataRole.UserRole, _normpath(e.path))
+                it.setData(0, self._LOADED_ROLE, False)
+                # 占位子项（让展开箭头显示）
+                placeholder = QTreeWidgetItem([""])
+                placeholder.setHidden(True)
+                it.addChild(placeholder)
                 parent_item.addChild(it)
-                self._scan_dir(e.path, it, dir_ico, file_ico, _depth + 1)
-                if it.childCount() == 0:
-                    parent_item.removeChild(it)
             elif e.is_file():
                 if os.path.splitext(e.name)[1].lower() in VIDEO_EXT:
                     it = QTreeWidgetItem([e.name])
@@ -1223,6 +1369,23 @@ class PlayerWindow(QMainWindow):
                     it.setData(0, Qt.ItemDataRole.UserRole, _normpath(e.path))
                     parent_item.addChild(it)
                     self.playlist.append(_normpath(e.path))
+
+    def _lazy_load_dir(self, item: QTreeWidgetItem):
+        """展开文件夹时懒加载其内容"""
+        if item.data(0, self._LOADED_ROLE):
+            return  # 已加载过
+        folder = item.data(0, Qt.ItemDataRole.UserRole)
+        if not folder or not os.path.isdir(folder):
+            return
+        # 移除占位项
+        for i in range(item.childCount() - 1, -1, -1):
+            child = item.child(i)
+            if child.isHidden():
+                item.removeChild(child)
+        dir_ico = self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+        file_ico = self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+        self._scan_dir(folder, item, dir_ico, file_ico)
+        item.setData(0, self._LOADED_ROLE, True)
 
     # ── 播放控制 ──────────────────────────────────────────────────────────────
     def _play(self, idx: int):
@@ -1245,6 +1408,8 @@ class PlayerWindow(QMainWindow):
             self.speed_box.setCurrentText(vs["speed"])
         if vs.get("volume") is not None:
             self.vol_slider.setValue(vs["volume"])
+        # 自动加载同名字幕
+        self._auto_load_subtitle(path)
 
     def _prepare(self, idx: int):
         """仅设置当前项并高亮，不加载媒体、不播放（用于文件夹加载）"""
@@ -1903,6 +2068,33 @@ class PlayerWindow(QMainWindow):
 
         menu.addSeparator()
 
+        # 字幕子菜单
+        sub_menu = menu.addMenu("💬  字幕")
+        sub_menu.setStyleSheet(menu.styleSheet())
+        sub_status = "✓ " if self._subtitles_enabled else "   "
+        a_toggle = sub_menu.addAction(sub_status + "显示 / 隐藏字幕  [Ctrl+L]")
+        a_toggle.triggered.connect(self._toggle_subtitles)
+        sub_menu.addAction("加载字幕文件…  [Ctrl+Shift+L]").triggered.connect(self._load_subtitle_file)
+        if self._subtitle_path:
+            sub_menu.addAction(f"当前: {os.path.basename(self._subtitle_path)}").setEnabled(False)
+
+        # 音轨子菜单（多音轨视频）
+        tracks = self.player.audioTracks()
+        if len(tracks) > 1:
+            audio_menu = menu.addMenu("🎵  音轨")
+            audio_menu.setStyleSheet(menu.styleSheet())
+            for i, t in enumerate(tracks):
+                name = t.stringValue("displayName") or f"音轨 {i+1}"
+                a = audio_menu.addAction(("✓ " if i == self.player.activeAudioTrack() else "   ") + name)
+                a.triggered.connect(lambda _, idx=i: self.player.setActiveAudioTrack(idx))
+
+        menu.addSeparator()
+
+        # 跳转指定时间
+        menu.addAction("⏱  跳转到时间…  [Ctrl+G]").triggered.connect(self._jump_to_time)
+
+        menu.addSeparator()
+
         # 全屏
         fs_txt = "⛶  退出全屏" if self.isFullScreen() else "⛶  全屏"
         menu.addAction(fs_txt).triggered.connect(self.toggle_fullscreen)
@@ -1920,11 +2112,19 @@ class PlayerWindow(QMainWindow):
         # 截图
         menu.addSeparator()
         menu.addAction("📷  截图  [Ctrl+S]").triggered.connect(self._take_screenshot)
+        menu.addAction("📷  快速截图  [Ctrl+Shift+S]").triggered.connect(self._quick_screenshot)
 
         # 打开文件/文件夹
         menu.addSeparator()
         menu.addAction("📂  打开文件").triggered.connect(self.open_file)
         menu.addAction("📁  打开文件夹").triggered.connect(self.open_folder)
+
+        # 播放列表导入/导出
+        menu.addSeparator()
+        io_menu = menu.addMenu("📋  播放列表")
+        io_menu.setStyleSheet(menu.styleSheet())
+        io_menu.addAction("导入 M3U…").triggered.connect(self._import_m3u)
+        io_menu.addAction("导出 M3U…").triggered.connect(self._export_m3u)
 
         menu.exec(self.video.mapToGlobal(pos))
 
@@ -1936,6 +2136,11 @@ class PlayerWindow(QMainWindow):
         dur = self.player.duration()
         if pos > 0:
             self._dm.set_position(self.playlist[self.current_index], pos, dur)
+            self._pos_dirty = False
+
+    def _mark_pos_dirty(self):
+        """标记位置需要保存（由 _tick 定期 flush）"""
+        self._pos_dirty = True
 
     # ── 侧边栏显隐 ────────────────────────────────────────────────────────────
     def toggle_sidebar(self):
@@ -1954,14 +2159,17 @@ class PlayerWindow(QMainWindow):
         dur = self.player.duration()
         if dur:
             self.player.setPosition(int(val * dur / 10_000))
+            self._pos_dirty = True
 
     def _seek_rel(self, ms: int):
         pos = max(0, min(self.player.position() + ms, self.player.duration()))
         self.player.setPosition(pos)
+        self._pos_dirty = True
         self._show_osd(f"{'⏩' if ms > 0 else '⏪'} {self._fmt_time(pos)}")
 
     def _vol_delta(self, delta: int):
         self.vol_slider.setValue(max(0, min(100, self.vol_slider.value() + delta)))
+        self._prefs_dirty = True
         self._show_osd(f"🔊 音量 {self.vol_slider.value()}%")
 
     # ── 定时刷新 + 自动保存 ───────────────────────────────────────────────────
@@ -1971,12 +2179,42 @@ class PlayerWindow(QMainWindow):
         self.lbl_pos.setText(self._fmt_time(pos))
         if dur > 0 and not self.seek_slider.isSliderDown():
             self.seek_slider.setValue(int(pos * 10_000 / dur))
+
+        # 字幕显示
+        self._update_subtitle(pos)
+
+        # 自动保存（dirty-flag：只有位置变化时才写盘）
         self._autosave_counter += 1
         if self._autosave_counter >= 75:
             self._autosave_counter = 0
-            self._save_current_position()
-            # 同步保存音量和倍速偏好
-            self._dm.set_prefs(self.vol_slider.value(), self.speed_box.currentText())
+            if self._pos_dirty:
+                self._save_current_position()
+            if self._prefs_dirty:
+                self._dm.set_prefs(self.vol_slider.value(), self.speed_box.currentText())
+                self._prefs_dirty = False
+
+    def _update_subtitle(self, pos: int):
+        """根据当前播放位置更新字幕显示"""
+        if not self._subtitles_enabled or not self._subtitles:
+            self._subtitle_label.set_subtitle("")
+            return
+        # 二分查找当前字幕
+        lo, hi = 0, len(self._subtitles) - 1
+        idx = -1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            start, end, _ = self._subtitles[mid]
+            if pos < start:
+                hi = mid - 1
+            elif pos > end:
+                lo = mid + 1
+            else:
+                idx = mid
+                break
+        if idx >= 0:
+            self._subtitle_label.set_subtitle(self._subtitles[idx][2])
+        else:
+            self._subtitle_label.set_subtitle("")
 
     # ── 播放器回调 ────────────────────────────────────────────────────────────
     def _on_state_changed(self, state):
@@ -2010,6 +2248,20 @@ class PlayerWindow(QMainWindow):
                 self._play(0 if next_idx >= len(self.playlist) else next_idx)
             else:                                   # 不循环
                 self.play_next()
+        elif status == QMediaPlayer.MediaStatus.InvalidMedia:
+            self._show_media_error("不支持的媒体格式或文件已损坏")
+        elif status == QMediaPlayer.MediaStatus.BufferedMedia:
+            pass  # 缓冲完成，无需处理
+
+    def _on_player_error(self, error, error_string):
+        """播放器错误回调"""
+        msg = error_string or str(error)
+        self._show_media_error(msg)
+
+    def _show_media_error(self, msg: str):
+        """显示媒体错误提示（OSD + 状态栏）"""
+        self._show_osd(f"⚠️  {msg}")
+        self._status_bar.showMessage(f"播放错误: {msg}", 5000)
 
     def _do_resume(self, pos: int, expected_source):
         """恢复播放位置，校验 source 未变（防止快速切歌后误操作）"""
@@ -2069,6 +2321,7 @@ class PlayerWindow(QMainWindow):
         try:
             self.player.setPlaybackRate(float(text.rstrip("x")))
             self._show_osd(f"⏩ 速度 {text}")
+            self._prefs_dirty = True
             # 保存独立设置
             if self.current_index >= 0:
                 self._dm.set_video_settings(
@@ -2078,6 +2331,7 @@ class PlayerWindow(QMainWindow):
 
     def _on_vol_changed(self, value: int):
         self.audio_out.setVolume(value / 100.0)
+        self._prefs_dirty = True
         # 保存独立设置（延迟合并写入，避免拖动时高频写盘）
         if self.current_index >= 0:
             self._defer_video_settings(volume=value)
@@ -2096,6 +2350,8 @@ class PlayerWindow(QMainWindow):
     def _on_tree_expand(self, item: QTreeWidgetItem):
         folder = item.data(0, Qt.ItemDataRole.UserRole)
         if folder and os.path.isdir(folder):
+            # 懒加载子目录内容
+            self._lazy_load_dir(item)
             # 找到顶层父节点（根文件夹）
             root_folder = self._get_root_folder(item)
             if root_folder:
@@ -2206,9 +2462,193 @@ class PlayerWindow(QMainWindow):
         for i in range(root.childCount()):
             filter_item(root.child(i))
 
-    # ── 截图（占位，Phase 4 完善）────────────────────────────────────────────
+    # ── 字幕 ─────────────────────────────────────────────────────────────────
+    def _auto_load_subtitle(self, video_path: str):
+        """自动加载与视频同名的字幕文件"""
+        base = os.path.splitext(video_path)[0]
+        for ext in (".srt", ".vtt"):
+            sub_path = base + ext
+            if os.path.isfile(sub_path):
+                self._load_subtitle(sub_path)
+                return
+        # 未找到同名字幕则清空
+        self._subtitles = []
+        self._subtitle_path = None
+        self._subtitle_label.set_subtitle("")
+
+    def _load_subtitle_file(self):
+        """弹出文件选择框加载字幕"""
+        last_dir = self._dm.get_last_dir() or str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(
+            self, "加载字幕文件", last_dir,
+            "字幕文件 (*.srt *.vtt);;所有文件 (*.*)")
+        if path:
+            self._load_subtitle(path)
+
+    def _load_subtitle(self, path: str):
+        cues = parse_subtitle(path)
+        if cues:
+            self._subtitles = cues
+            self._subtitle_path = path
+            self._subtitles_enabled = True
+            self._show_osd(f"💬 字幕已加载: {os.path.basename(path)}")
+        else:
+            self._subtitles = []
+            self._subtitle_path = None
+            self._show_osd("字幕加载失败或文件为空")
+
+    def _toggle_subtitles(self):
+        self._subtitles_enabled = not self._subtitles_enabled
+        if not self._subtitles_enabled:
+            self._subtitle_label.set_subtitle("")
+        self._show_osd(f"字幕: {'开' if self._subtitles_enabled else '关'}")
+
+    # ── 跳转指定时间 ──────────────────────────────────────────────────────────
+    def _jump_to_time(self):
+        if self.current_index < 0 or self.player.duration() <= 0:
+            return
+        cur = self._fmt_time(self.player.position())
+        text, ok = QInputDialog.getText(
+            self, "跳转到时间",
+            f"输入时间 (格式 HH:MM:SS 或 秒数)\n当前: {cur}",
+            text=cur)
+        if not ok or not text.strip():
+            return
+        text = text.strip()
+        ms = self._parse_time_input(text)
+        if ms is None:
+            self._show_osd("时间格式无效")
+            return
+        dur = self.player.duration()
+        ms = max(0, min(ms, dur))
+        self.player.setPosition(ms)
+        self._pos_dirty = True
+        self._show_osd(f"⏱  {self._fmt_time(ms)}")
+
+    @staticmethod
+    def _parse_time_input(text: str) -> int | None:
+        """解析 HH:MM:SS 或纯秒数为毫秒"""
+        if ":" in text:
+            parts = text.split(":")
+            try:
+                if len(parts) == 3:
+                    h, m, s = int(parts[0]), int(parts[1]), float(parts[2])
+                elif len(parts) == 2:
+                    h, m, s = 0, int(parts[0]), float(parts[1])
+                else:
+                    return None
+                return int((h * 3600 + m * 60 + s) * 1000)
+            except (ValueError, IndexError):
+                return None
+        try:
+            return int(float(text) * 1000)
+        except ValueError:
+            return None
+
+    # ── 鼠标滚轮快进/快退 ────────────────────────────────────────────────────
+    def _on_video_wheel(self, angle_delta_y: int):
+        if self.current_index < 0:
+            return
+        # 每滚轮刻度约 120，对应 5 秒
+        steps = angle_delta_y / 120
+        delta_ms = int(steps * 5_000)
+        if delta_ms != 0:
+            self._seek_rel(delta_ms)
+
+    # ── 关于 / 快捷键帮助 ────────────────────────────────────────────────────
+    def _show_about(self):
+        QMessageBox.about(
+            self, "关于 Video Player",
+            f"<h3>Video Player</h3>"
+            f"<p>版本 {VERSION}</p>"
+            f"<p>基于 PyQt6 + Qt Multimedia 的轻量级视频播放器</p>"
+            f"<p>支持书签、播放进度记忆、字幕、截图等功能</p>"
+            f"<p style='color:#888;'>© 2026 Video Player</p>"
+        )
+
+    def _show_shortcuts_help(self):
+        shortcuts = (
+            "<h3>快捷键说明</h3>"
+            "<table>"
+            "<tr><td>Space</td><td>播放 / 暂停</td></tr>"
+            "<tr><td>M</td><td>添加书签</td></tr>"
+            "<tr><td>P</td><td>显示 / 隐藏 侧边栏</td></tr>"
+            "<tr><td>F / 双击</td><td>全屏切换</td></tr>"
+            "<tr><td>← / →</td><td>快退 / 快进 5 秒</td></tr>"
+            "<tr><td>Shift+← / →</td><td>快退 / 快进 30 秒</td></tr>"
+            "<tr><td>↑ / ↓</td><td>音量 +5 / -5</td></tr>"
+            "<tr><td>N / B</td><td>下一个 / 上一个</td></tr>"
+            "<tr><td>滚轮</td><td>快进 / 快退 5 秒</td></tr>"
+            "<tr><td>Ctrl+G</td><td>跳转到指定时间</td></tr>"
+            "<tr><td>[ / ]</td><td>上一个 / 下一个书签</td></tr>"
+            "<tr><td>Ctrl+L</td><td>显示 / 隐藏字幕</td></tr>"
+            "<tr><td>Ctrl+Shift+L</td><td>加载字幕文件</td></tr>"
+            "<tr><td>Ctrl+S</td><td>截图</td></tr>"
+            "<tr><td>Ctrl+Shift+S</td><td>快速截图</td></tr>"
+            "<tr><td>Ctrl+F / /</td><td>搜索播放列表</td></tr>"
+            "<tr><td>Ctrl+O</td><td>打开文件</td></tr>"
+            "<tr><td>Ctrl+Shift+O</td><td>打开文件夹</td></tr>"
+            "</table>"
+        )
+        QMessageBox.about(self, "快捷键说明", shortcuts)
+
+    # ── M3U 播放列表导入/导出 ────────────────────────────────────────────────
+    def _import_m3u(self):
+        last_dir = self._dm.get_last_dir() or str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入 M3U 播放列表", last_dir,
+            "M3U 文件 (*.m3u *.m3u8);;所有文件 (*.*)")
+        if not path:
+            return
+        try:
+            raw = Path(path).read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            self._show_osd(f"导入失败: {e}")
+            return
+        paths = []
+        base_dir = os.path.dirname(path)
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not os.path.isabs(line):
+                line = os.path.join(base_dir, line)
+            line = _normpath(line)
+            if os.path.splitext(line)[1].lower() in VIDEO_EXT and os.path.isfile(line):
+                paths.append(line)
+        if not paths:
+            self._show_osd("M3U 中没有可播放的视频文件")
+            return
+        self._append_file_paths(paths)
+        self._show_osd(f"已导入 {len(paths)} 个文件")
+
+    def _export_m3u(self):
+        if not self.playlist:
+            self._show_osd("播放列表为空")
+            return
+        last_dir = self._dm.get_last_dir() or str(Path.home())
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出 M3U 播放列表",
+            os.path.join(last_dir, "playlist.m3u"),
+            "M3U 文件 (*.m3u)")
+        if not path:
+            return
+        try:
+            lines = ["#EXTM3U"]
+            for p in self.playlist:
+                lines.append(p)
+            Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+            self._show_osd(f"已导出 {len(self.playlist)} 个文件")
+        except Exception as e:
+            self._show_osd(f"导出失败: {e}")
+
+    # ── 截图 ─────────────────────────────────────────────────────────────────
     def _take_screenshot(self):
         if self.current_index < 0:
+            return
+        pixmap = self._capture_frame()
+        if pixmap is None or pixmap.isNull():
+            self._show_osd("截图失败：无法获取视频帧")
             return
         screenshots_dir = str(Path.home() / "Pictures")
         os.makedirs(screenshots_dir, exist_ok=True)
@@ -2218,19 +2658,50 @@ class PlayerWindow(QMainWindow):
             self, "保存截图", default_name, "PNG 图片 (*.png)")
         if not file_path:
             return
-        screen = self.video.screen()
-        if screen:
-            pixmap = screen.grabWindow(self.video.winId())
-            if not pixmap.isNull():
-                pixmap.save(file_path)
-                self._show_osd(f"📷 截图已保存")
-                return
-        self._show_osd("截图失败")
+        if pixmap.save(file_path):
+            self._show_osd(f"📷 截图已保存")
+        else:
+            self._show_osd("截图保存失败")
 
-    # ── OSD 位置更新 ─────────────────────────────────────────────────────────
+    def _quick_screenshot(self):
+        """快速截图：直接保存到默认目录，不弹对话框"""
+        if self.current_index < 0:
+            return
+        pixmap = self._capture_frame()
+        if pixmap is None or pixmap.isNull():
+            self._show_osd("截图失败：无法获取视频帧")
+            return
+        screenshots_dir = str(Path.home() / "Pictures")
+        os.makedirs(screenshots_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_path = os.path.join(screenshots_dir, f"screenshot_{ts}.png")
+        if pixmap.save(file_path):
+            self._show_osd(f"📷 已保存到 {os.path.basename(file_path)}")
+        else:
+            self._show_osd("截图保存失败")
+
+    def _capture_frame(self) -> QPixmap | None:
+        """从视频 sink 获取当前帧并转为 QPixmap"""
+        frame = self.video_sink.videoFrame()
+        if frame is None or not frame.isValid():
+            return None
+        # QVideoFrame → QImage → QPixmap
+        from PyQt6.QtGui import QImage as _QImage
+        img = frame.toImage()
+        if img.isNull():
+            return None
+        return QPixmap.fromImage(img)
+
+    # ── OSD / 字幕位置更新 ────────────────────────────────────────────────────
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._update_osd_position()
+        self._update_subtitle_position()
+
+    def _update_subtitle_position(self):
+        content = self._subtitle_label.parent()
+        if content:
+            self._subtitle_label.setGeometry(content.rect())
 
     def _update_osd_position(self):
         content = self._osd.parent()
@@ -2491,6 +2962,13 @@ class TrayManager(QObject):
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setApplicationName("Video Player")
+    app.setApplicationVersion(VERSION)
+
+    # 应用程序图标（任务栏 / 标题栏）
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+    if os.path.isfile(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
 
     pal = QPalette()
     colors = {
@@ -2513,6 +2991,20 @@ def main():
     app.setPalette(pal)
 
     win = PlayerWindow()
+
+    # 命令行参数：直接打开视频文件（支持"打开方式"）
+    cli_files = [
+        _normpath(a) for a in sys.argv[1:]
+        if os.path.isfile(a)
+        and os.path.splitext(a)[1].lower() in VIDEO_EXT
+    ]
+    if cli_files:
+        # 如果只有一个文件且存在同名字幕，也一并加载（由 _play 自动处理）
+        win._load_file_paths(cli_files)
+    elif len(sys.argv) > 1:
+        # 非视频文件参数（比如被当作"打开方式"传入但不是视频）忽略
+        pass
+
     win.show()
     sys.exit(app.exec())
 
