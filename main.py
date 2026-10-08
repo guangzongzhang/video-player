@@ -1691,7 +1691,7 @@ class PlayerWindow(QMainWindow):
         self._highlight_current()
         self._refresh_bm_list()
         self._refresh_continue_watching()
-        self._refresh_watched_style()
+        self._refresh_tree_watched_state()
         # 恢复该视频的独立设置
         vs = self._dm.get_video_settings(path)
         if vs.get("speed"):
