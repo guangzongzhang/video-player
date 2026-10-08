@@ -71,7 +71,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame
 from PyQt6.QtMultimediaWidgets import QVideoWidget
-from PyQt6.QtCore import Qt, QTimer, QUrl, QPoint, QPointF, QObject, pyqtSignal, QRect
+from PyQt6.QtCore import Qt, QTimer, QUrl, QPoint, QPointF, QObject, pyqtSignal, QRect, QSize
 from PyQt6.QtGui import (
     QKeySequence, QShortcut, QPalette, QColor, QPainter, QPolygonF,
     QPixmap, QScreen, QDragEnterEvent, QDropEvent, QIcon, QImage,
@@ -1063,6 +1063,7 @@ class PlayerWindow(QMainWindow):
         self.cw_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.cw_list.customContextMenuRequested.connect(self._cw_context_menu)
         self.cw_list.itemDoubleClicked.connect(self._on_cw_dbl_click)
+        self.cw_list.installEventFilter(self)
         cw_vl.addWidget(self.cw_list)
 
         cw_bar = self._make_toolbar()
@@ -1899,6 +1900,7 @@ class PlayerWindow(QMainWindow):
     def _refresh_continue_watching(self):
         """刷新继续观看列表"""
         from PyQt6.QtGui import QFont
+        from PyQt6.QtWidgets import QSizePolicy
         self.cw_list.clear()
         items = self._dm.get_continue_watching()
         for entry in items:
@@ -1914,8 +1916,9 @@ class PlayerWindow(QMainWindow):
             lbl_name.setStyleSheet("color:#ccc;font-size:13px;font-family:'Microsoft YaHei','SimSun',sans-serif;")
             lbl_name.setFont(QFont("Microsoft YaHei", 13))
             lbl_name.setWordWrap(True)
-            lbl_name.setToolTip(name)
+            lbl_name.setToolTip(path)
             lbl_name.setMinimumWidth(0)
+            lbl_name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             hl.addWidget(lbl_name, stretch=1)
             bar = QSlider(Qt.Orientation.Horizontal)
             bar.setRange(0, 100)
@@ -1932,25 +1935,52 @@ class PlayerWindow(QMainWindow):
             hl.addWidget(lbl_pct)
             list_item = QListWidgetItem()
             list_item.setData(Qt.ItemDataRole.UserRole, path)
-            hint = widget.sizeHint()
-            hint.setHeight(max(hint.height(), 44))
-            list_item.setSizeHint(hint)
+            # 估算文本换行后的高度（留出足够空间避免文字被裁切）
+            fm = lbl_name.fontMetrics()
+            approx_name_width = max(self.cw_list.viewport().width() - 160, 100)
+            wrapped_rect = fm.boundingRect(
+                0, 0, approx_name_width, 1000,
+                Qt.TextFlag.TextWordWrap, name
+            )
+            text_h = wrapped_rect.height()
+            list_item.setSizeHint(QSize(0, max(text_h + 8, 44)))
             self.cw_list.addItem(list_item)
             self.cw_list.setItemWidget(list_item, widget)
+        # 布局完成后再校准一次高度
         QTimer.singleShot(0, self._adjust_cw_item_heights)
 
     def _adjust_cw_item_heights(self):
         """布局完成后根据实际 widget 高度更新继续观看列表项高度"""
+        from PyQt6.QtWidgets import QLabel
         for i in range(self.cw_list.count()):
             item = self.cw_list.item(i)
             widget = self.cw_list.itemWidget(item)
             if widget is None:
                 continue
+            # 找到名称 label，根据实际可用宽度计算换行高度
+            name_lbl = None
+            for child in widget.findChildren(QLabel):
+                if child.styleSheet().startswith("color:#ccc"):
+                    name_lbl = child
+                    break
+            if name_lbl is not None:
+                avail_w = max(widget.width() - 160, 100)
+                fm = name_lbl.fontMetrics()
+                rect = fm.boundingRect(0, 0, avail_w, 1000,
+                                       Qt.TextFlag.TextWordWrap, name_lbl.text())
+                needed = max(rect.height() + 8, 44)
+            else:
+                needed = max(widget.sizeHint().height(), 44)
             hint = item.sizeHint()
-            new_h = widget.sizeHint().height()
-            if new_h > 0 and new_h != hint.height():
-                hint.setHeight(new_h)
+            if hint.height() != needed:
+                hint.setHeight(needed)
                 item.setSizeHint(hint)
+
+    def eventFilter(self, obj, event):
+        """监听继续观看列表尺寸变化，重新计算换行高度"""
+        if obj is self.cw_list and event.type() == event.Type.Resize:
+            QTimer.singleShot(0, self._adjust_cw_item_heights)
+        return super().eventFilter(obj, event)
 
     @staticmethod
     def _estimate_progress(pos: int, duration: int) -> int:
