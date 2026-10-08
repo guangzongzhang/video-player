@@ -489,13 +489,15 @@ class DataManager:
 
     def set_position(self, path: str, pos: int, duration: int):
         path = _normpath(path)
-        if pos < 5_000:
-            self._data["last_positions"].pop(path, None)
-        elif duration > 0 and pos >= duration * 0.95:
+        # 只要打开过就保存进继续观看列表（不再有 5 秒阈值）
+        if duration > 0 and pos >= duration * 0.95:
             # 接近结尾（95%），视为看完，移除进度记录
             self._data["last_positions"].pop(path, None)
         else:
-            self._data["last_positions"][path] = {"pos": pos, "dur": duration}
+            self._data["last_positions"][path] = {
+                "pos": pos, "dur": duration,
+                "opened_at": datetime.now().timestamp(),
+            }
         # 播放超过 90% 自动标记为已看
         if duration > 0 and pos > duration * 0.9:
             self.set_watched(path, True)
@@ -504,6 +506,17 @@ class DataManager:
     # ── 已看/未看 ─────────────────────────────────────────────────────────────
     def is_watched(self, path: str) -> bool:
         return self._data.get("watched", {}).get(_normpath(path), False)
+
+    def has_position(self, path: str) -> bool:
+        """视频是否有播放记录（即打开过）"""
+        return _normpath(path) in self._data.get("last_positions", {})
+
+    def get_opened_at(self, path: str) -> float | None:
+        """返回视频最后打开的时间戳，无记录返回 None"""
+        val = self._data.get("last_positions", {}).get(_normpath(path))
+        if isinstance(val, dict):
+            return val.get("opened_at")
+        return None
 
     def set_watched(self, path: str, watched: bool):
         path = _normpath(path)
@@ -515,7 +528,10 @@ class DataManager:
         self._save()
 
     def get_continue_watching(self) -> list[dict]:
-        """返回有播放进度但未标记为已看的视频列表（仅当前存在的文件）"""
+        """返回有播放记录且未标记为已看的视频列表（仅当前存在的文件）
+
+        只要打开过（pos >= 0）就会出现在列表中，按最后打开时间倒序排列。
+        """
         positions = self._data.get("last_positions", {})
         watched = self._data.get("watched", {})
         result = []
@@ -525,8 +541,11 @@ class DataManager:
             if not os.path.isfile(path):
                 continue   # 文件暂时不存在（USB/网络盘），跳过显示但保留记录
             pos, dur = self._split_pos(value)
-            if pos > 0:
-                result.append({"path": path, "position": pos, "duration": dur})
+            opened_at = value.get("opened_at", 0) if isinstance(value, dict) else 0
+            result.append({"path": path, "position": pos, "duration": dur,
+                           "opened_at": opened_at})
+        # 按最后打开时间倒序
+        result.sort(key=lambda x: x.get("opened_at", 0), reverse=True)
         return result
 
     # ── 书签 ──────────────────────────────────────────────────────────────────
@@ -1012,6 +1031,7 @@ class PlayerWindow(QMainWindow):
         self.tree.setHeaderHidden(True)
         self.tree.setAnimated(True)
         self.tree.setIndentation(18)
+        self.tree.setRootIsDecorated(True)   # 确保文件夹展开箭头可见
         self.tree.setStyleSheet(self._tree_css())
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         pl_vl.addWidget(self.tree)
@@ -1494,6 +1514,7 @@ class PlayerWindow(QMainWindow):
                 it.setIcon(0, dir_ico)
                 it.setData(0, Qt.ItemDataRole.UserRole, _normpath(e.path))
                 it.setData(0, self._LOADED_ROLE, False)
+                it.setChildIndicatorPolicy(QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator)
                 placeholder = QTreeWidgetItem([""])
                 placeholder.setHidden(True)
                 it.addChild(placeholder)
@@ -1623,6 +1644,8 @@ class PlayerWindow(QMainWindow):
                 # 存子目录路径，展开时按需加载
                 it.setData(0, Qt.ItemDataRole.UserRole, _normpath(e.path))
                 it.setData(0, self._LOADED_ROLE, False)
+                # 强制显示展开箭头（即使子项被隐藏）
+                it.setChildIndicatorPolicy(QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator)
                 # 占位子项（让展开箭头显示）
                 placeholder = QTreeWidgetItem([""])
                 placeholder.setHidden(True)
@@ -1668,6 +1691,7 @@ class PlayerWindow(QMainWindow):
         self._highlight_current()
         self._refresh_bm_list()
         self._refresh_continue_watching()
+        self._refresh_watched_style()
         # 恢复该视频的独立设置
         vs = self._dm.get_video_settings(path)
         if vs.get("speed"):
@@ -1987,17 +2011,21 @@ class PlayerWindow(QMainWindow):
             self._update_item_watched_style(root.child(i))
 
     def _update_item_watched_style(self, item: QTreeWidgetItem):
-        """递归更新单个项及其子项的已看样式"""
+        """递归更新单个项及其子项的已看/近期观看样式"""
         path = item.data(0, Qt.ItemDataRole.UserRole)
         if path and os.path.isfile(path):
             is_watched = self._dm.is_watched(path)
+            has_pos = self._dm.has_position(path)
             name = os.path.basename(path)
             if is_watched:
                 display = f"✓ {name}"
-                item.setForeground(0, QColor("#666666"))
+                item.setForeground(0, QColor("#666666"))          # 已看完：灰色
+            elif has_pos:
+                display = name
+                item.setForeground(0, QColor("#4fc3f7"))          # 近期观看：浅蓝
             else:
                 display = name
-                item.setForeground(0, QColor("#cccccc"))
+                item.setForeground(0, QColor("#cccccc"))          # 未观看：默认色
             is_pinned = bool(item.data(0, _PINNED_ROLE))
             pin_prefix = "📌 " if is_pinned else ""
             item.setText(0, pin_prefix + display)
@@ -2446,9 +2474,9 @@ class PlayerWindow(QMainWindow):
             return
         pos = self.player.position()
         dur = self.player.duration()
-        if pos > 0:
-            self._dm.set_position(self.playlist[self.current_index], pos, dur)
-            self._pos_dirty = False
+        # pos >= 0 即保存（只要打开过就进继续观看列表）
+        self._dm.set_position(self.playlist[self.current_index], pos, dur)
+        self._pos_dirty = False
 
     def _mark_pos_dirty(self):
         """标记位置需要保存（由 _tick 定期 flush）"""
@@ -3180,7 +3208,6 @@ class PlayerWindow(QMainWindow):
             QTreeWidget::item { padding: 5px 2px; }
             QTreeWidget::item:hover    { background: #2a2a2a; border-radius: 3px; }
             QTreeWidget::item:selected { background: #0d6efd; color: #fff; border-radius: 3px; }
-            QTreeWidget::branch        { background: #1c1c1c; }
         """
 
 
