@@ -85,7 +85,7 @@ except ImportError:
     HAS_KEYBOARD = False
 
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 VIDEO_EXT = {
     ".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm",
     ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".mts", ".vob",
@@ -93,6 +93,39 @@ VIDEO_EXT = {
 }
 
 LOOP_LABELS = ["不循环", "单曲循环", "列表循环"]   # loop mode 0/1/2
+
+# 快捷键注册表：key=动作ID, value=(默认键, 中文描述, 是否焦点敏感)
+# 焦点敏感 = 搜索框聚焦时不触发
+SHORTCUT_DEFAULTS: dict[str, tuple[str, str, bool]] = {
+    "play_pause":      ("Space",       "播放 / 暂停", True),
+    "add_bookmark":    ("M",           "添加书签", True),
+    "toggle_sidebar":  ("P",           "显示 / 隐藏 播放列表", False),
+    "toggle_fullscreen": ("F",         "全屏切换", True),
+    "exit_fullscreen": ("Escape",      "退出全屏", False),
+    "play_next":       ("N",           "下一个", True),
+    "play_prev":       ("B",           "上一个", True),
+    "seek_forward_5":  ("Right",       "快进 5 秒", True),
+    "seek_back_5":     ("Left",        "快退 5 秒", True),
+    "seek_forward_30": ("Shift+Right", "快进 30 秒", True),
+    "seek_back_30":    ("Shift+Left",  "快退 30 秒", True),
+    "vol_up":          ("Up",          "音量 +5", True),
+    "vol_down":        ("Down",        "音量 -5", True),
+    "bm_prev":         ("[",           "上一个书签", True),
+    "bm_next":         ("]",           "下一个书签", True),
+    "search":          ("Ctrl+F",      "搜索播放列表", False),
+    "screenshot":      ("Ctrl+S",      "截图", False),
+    "quick_screenshot": ("Ctrl+Shift+S", "快速截图", False),
+    "open_file":       ("Ctrl+O",      "打开文件", False),
+    "open_folder":     ("Ctrl+Shift+O", "打开文件夹", False),
+    "jump_to_time":    ("Ctrl+G",      "跳转到指定时间", False),
+    "toggle_subtitle": ("Ctrl+L",      "显示 / 隐藏字幕", False),
+    "load_subtitle":   ("Ctrl+Shift+L", "加载字幕文件", False),
+    "size_50":         ("Ctrl+1",      "窗口 50% 大小", False),
+    "size_100":        ("Ctrl+2",      "窗口 100% 大小", False),
+    "size_200":        ("Ctrl+3",      "窗口 200% 大小", False),
+    "size_native":     ("Ctrl+0",      "原始尺寸", False),
+    "settings":        ("Ctrl+,",      "打开设置", False),
+}
 _PINNED_ROLE = Qt.ItemDataRole.UserRole + 1        # 自定义角色：节点是否钉住
 
 
@@ -207,6 +240,8 @@ class DataManager:
         data.setdefault("last_session", None)
         data.setdefault("last_dir", "")
         data.setdefault("prefs", {"volume": 80, "speed": "1.0x"})
+        data.setdefault("settings", {})
+        data.setdefault("shortcuts", {})
         for section in ("last_positions", "bookmarks", "video_settings",
                         "watched", "folder_states"):
             if not isinstance(data.get(section), dict):
@@ -276,6 +311,46 @@ class DataManager:
     def set_prefs(self, volume: int, speed: str):
         self._data["prefs"] = {"volume": volume, "speed": speed}
         self._save()
+
+    # ── 通用设置 ──────────────────────────────────────────────────────────────
+    _DEFAULT_SETTINGS = {
+        "autoplay": True,
+        "remember_position": True,
+        "screenshot_dir": "",
+        "show_osd": True,
+        "subtitle_font_size": 22,
+    }
+
+    def get_setting(self, key: str, default=None):
+        s = self._data.setdefault("settings", dict(self._DEFAULT_SETTINGS))
+        return s.get(key, default if default is not None else self._DEFAULT_SETTINGS.get(key))
+
+    def set_setting(self, key: str, value):
+        s = self._data.setdefault("settings", dict(self._DEFAULT_SETTINGS))
+        s[key] = value
+        self._save()
+
+    def get_all_settings(self) -> dict:
+        s = dict(self._DEFAULT_SETTINGS)
+        s.update(self._data.get("settings", {}))
+        return s
+
+    # ── 自定义快捷键 ──────────────────────────────────────────────────────────
+    def get_shortcuts(self) -> dict[str, str]:
+        """返回用户自定义快捷键映射 {动作ID: 键序列}（未自定义的不返回）"""
+        return dict(self._data.get("shortcuts", {}))
+
+    def set_shortcuts(self, shortcuts: dict[str, str]):
+        self._data["shortcuts"] = shortcuts
+        self._save()
+
+    def get_shortcut(self, action_id: str) -> str:
+        """返回该动作当前生效的键序列（默认值或用户自定义值）"""
+        custom = self._data.get("shortcuts", {}).get(action_id)
+        if custom is not None:
+            return custom
+        default = SHORTCUT_DEFAULTS.get(action_id, ("", "", False))[0]
+        return default
 
     def _save(self):
         try:
@@ -656,6 +731,170 @@ class VideoWidget(QVideoWidget):
         self.window().dropEvent(event)
 
 
+# ── 快捷键捕获输入框 ──────────────────────────────────────────────────────────
+class KeySequenceEdit(QLineEdit):
+    """点击后捕获下一次按键组合的输入框"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setPlaceholderText("点击后按下快捷键…")
+        self._capturing = False
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._capturing = True
+            self.setText("请按下快捷键…")
+            self.setFocus()
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event):
+        if not self._capturing:
+            super().keyPressEvent(event)
+            return
+        key = event.key()
+        # 忽略纯修饰键
+        if key in (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt,
+                   Qt.Key.Key_Meta, Qt.Key.Key_AltGr):
+            super().keyPressEvent(event)
+            return
+        mods = event.modifiers()
+        seq = QKeySequence(mods, key).toString(QKeySequence.SequenceFormat.PortableText)
+        if not seq:
+            seq = QKeySequence(key).toString(QKeySequence.SequenceFormat.PortableText)
+        self.setText(seq)
+        self._capturing = False
+
+    def clear_key(self):
+        self.setText("")
+        self._capturing = False
+
+    def key_value(self) -> str:
+        return self.text().strip()
+
+
+# ── 设置对话框 ────────────────────────────────────────────────────────────────
+class SettingsDialog(QDialog):
+    """通用设置 + 快捷键设置"""
+
+    def __init__(self, dm: DataManager, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("设置")
+        self.resize(560, 460)
+        self._dm = dm
+
+        tabs = QTabWidget()
+        tabs.addTab(self._build_general_tab(), "通用")
+        tabs.addTab(self._build_shortcuts_tab(), "快捷键")
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+        vl = QVBoxLayout(self)
+        vl.addWidget(tabs)
+        vl.addWidget(btns)
+
+    def _build_general_tab(self) -> QWidget:
+        w = QWidget()
+        fl = QFormLayout(w)
+        fl.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self.chk_autoplay = QCheckBox("打开后自动播放")
+        self.chk_autoplay.setChecked(self._dm.get_setting("autoplay", True))
+        fl.addRow("播放：", self.chk_autoplay)
+
+        self.chk_remember = QCheckBox("记住每个视频的播放位置")
+        self.chk_remember.setChecked(self._dm.get_setting("remember_position", True))
+        fl.addRow("记忆：", self.chk_remember)
+
+        self.chk_osd = QCheckBox("操作时显示 OSD 提示")
+        self.chk_osd.setChecked(self._dm.get_setting("show_osd", True))
+        fl.addRow("界面：", self.chk_osd)
+
+        # 截图目录
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        self.edit_shot_dir = QLineEdit(self._dm.get_setting("screenshot_dir", "") or "")
+        self.edit_shot_dir.setPlaceholderText("留空则保存到 图片 文件夹")
+        btn_browse = QPushButton("浏览…")
+        btn_browse.clicked.connect(self._pick_screenshot_dir)
+        h.addWidget(self.edit_shot_dir)
+        h.addWidget(btn_browse)
+        fl.addRow("截图目录：", row)
+
+        # 字幕字号
+        self.spin_sub_size = QLineEdit(str(self._dm.get_setting("subtitle_font_size", 22)))
+        fl.addRow("字幕字号：", self.spin_sub_size)
+
+        return w
+
+    def _pick_screenshot_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择截图保存目录")
+        if d:
+            self.edit_shot_dir.setText(d)
+
+    def _build_shortcuts_tab(self) -> QWidget:
+        w = QWidget()
+        vl = QVBoxLayout(w)
+
+        tip = QLabel("双击或点击按键列修改快捷键；留空表示禁用该快捷键。")
+        tip.setStyleSheet("color:#888;")
+        vl.addWidget(tip)
+
+        self._key_edits: dict[str, KeySequenceEdit] = {}
+        for action_id, (default_key, desc, _) in SHORTCUT_DEFAULTS.items():
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(8)
+
+            lbl = QLabel(desc)
+            lbl.setMinimumWidth(180)
+            edit = KeySequenceEdit()
+            edit.setText(self._dm.get_shortcut(action_id))
+            btn_reset = QPushButton("重置")
+            btn_reset.setFixedWidth(56)
+            btn_reset.clicked.connect(lambda _, aid=action_id, ed=edit: ed.setText(SHORTCUT_DEFAULTS[aid][0]))
+            btn_clear = QPushButton("清空")
+            btn_clear.setFixedWidth(56)
+            btn_clear.clicked.connect(edit.clear_key)
+
+            h.addWidget(lbl)
+            h.addWidget(edit, stretch=1)
+            h.addWidget(btn_reset)
+            h.addWidget(btn_clear)
+            vl.addWidget(row)
+            self._key_edits[action_id] = edit
+
+        vl.addStretch()
+        return w
+
+    def get_values(self) -> tuple[dict, dict]:
+        """返回 (settings, shortcuts)"""
+        settings = {
+            "autoplay": self.chk_autoplay.isChecked(),
+            "remember_position": self.chk_remember.isChecked(),
+            "show_osd": self.chk_osd.isChecked(),
+            "screenshot_dir": self.edit_shot_dir.text().strip(),
+        }
+        try:
+            settings["subtitle_font_size"] = int(self.spin_sub_size.text())
+        except ValueError:
+            settings["subtitle_font_size"] = 22
+
+        shortcuts: dict[str, str] = {}
+        for action_id, edit in self._key_edits.items():
+            val = edit.key_value()
+            default = SHORTCUT_DEFAULTS[action_id][0]
+            # 只保存与默认值不同的（包括空字符串=禁用）
+            if val != default:
+                shortcuts[action_id] = val
+        return settings, shortcuts
+
+
 # ── 主窗口 ───────────────────────────────────────────────────────────────────
 class PlayerWindow(QMainWindow):
     def __init__(self):
@@ -682,6 +921,9 @@ class PlayerWindow(QMainWindow):
         # 自动保存 dirty-flag（减少磁盘写入）
         self._pos_dirty = False
         self._prefs_dirty = False
+
+        # 快捷键对象列表（用于设置修改后重建）
+        self._shortcuts: list[QShortcut] = []
 
         self._dm = DataManager()
 
@@ -880,6 +1122,13 @@ class PlayerWindow(QMainWindow):
         self._subtitle_label = SubtitleLabel(content)
         self._subtitle_label.setGeometry(content.rect())
         self._subtitle_label.raise_()
+        # 应用设置中的字幕字号
+        sub_size = self._dm.get_setting("subtitle_font_size", 22)
+        self._subtitle_label.setStyleSheet(
+            f"color: #ffffff; font-size: {sub_size}px; font-weight: bold;"
+            " background: transparent; padding: 0 12px 24px 12px;"
+            " font-family: 'Microsoft YaHei','SimHei',sans-serif;"
+        )
 
         # OSD 叠层提示
         self._osd = OSDLabel(content)
@@ -939,6 +1188,10 @@ class PlayerWindow(QMainWindow):
         act_about.triggered.connect(self._show_about)
         act_shortcuts = m_help.addAction("快捷键说明")
         act_shortcuts.triggered.connect(self._show_shortcuts_help)
+
+        m_tools = mb.addMenu("工具(&T)")
+        act_settings = m_tools.addAction("设置…  [Ctrl+,]")
+        act_settings.triggered.connect(self._show_settings)
 
     def _build_controls(self):
         w = QWidget()
@@ -1014,47 +1267,63 @@ class PlayerWindow(QMainWindow):
 
     # ── 快捷键 ────────────────────────────────────────────────────────────────
     def _build_shortcuts(self):
-        def sc(key, fn):
-            QShortcut(QKeySequence(key), self, activated=fn)
+        """根据注册表构建所有快捷键（支持用户自定义覆盖）"""
+        # 清除旧的快捷键对象
+        for s in self._shortcuts:
+            s.setParent(None)
+        self._shortcuts.clear()
 
-        def sc_focus_aware(key, fn):
-            """搜索框聚焦时不触发（避免输入字符触发播放控制）"""
-            def wrapper():
-                if self._search_box.hasFocus():
-                    return
-                fn()
-            QShortcut(QKeySequence(key), self, activated=wrapper)
+        def add(action_id: str, fn):
+            default_key, _, focus_aware = SHORTCUT_DEFAULTS.get(action_id, ("", "", False))
+            key = self._dm.get_shortcut(action_id)
+            if not key:
+                return  # 空字符串 = 用户禁用该快捷键
+            if focus_aware:
+                def wrapper(f=fn):
+                    if self._search_box.hasFocus():
+                        return
+                    f()
+                sc = QShortcut(QKeySequence(key), self, activated=wrapper)
+            else:
+                sc = QShortcut(QKeySequence(key), self, activated=fn)
+            self._shortcuts.append(sc)
 
-        sc_focus_aware("Space",       self.toggle_play)
-        sc_focus_aware("M",           self.add_bookmark)
-        sc("P",           self.toggle_sidebar)
-        sc_focus_aware("F",           self.toggle_fullscreen)
-        sc("Escape",      self._exit_fullscreen)
-        sc_focus_aware("N",           self.play_next)
-        sc_focus_aware("B",           self.play_prev)
-        sc_focus_aware("Right",       lambda: self._seek_rel(5_000))
-        sc_focus_aware("Left",        lambda: self._seek_rel(-5_000))
-        sc_focus_aware("Shift+Right", lambda: self._seek_rel(30_000))
-        sc_focus_aware("Shift+Left",  lambda: self._seek_rel(-30_000))
-        sc_focus_aware("Up",          lambda: self._vol_delta(5))
-        sc_focus_aware("Down",        lambda: self._vol_delta(-5))
-        # 书签跳转
-        sc_focus_aware("[",           lambda: self._jump_adjacent_bookmark(-1))
-        sc_focus_aware("]",           lambda: self._jump_adjacent_bookmark(1))
+        add("play_pause",       self.toggle_play)
+        add("add_bookmark",     self.add_bookmark)
+        add("toggle_sidebar",   self.toggle_sidebar)
+        add("toggle_fullscreen", self.toggle_fullscreen)
+        add("exit_fullscreen",  self._exit_fullscreen)
+        add("play_next",        self.play_next)
+        add("play_prev",        self.play_prev)
+        add("seek_forward_5",   lambda: self._seek_rel(5_000))
+        add("seek_back_5",      lambda: self._seek_rel(-5_000))
+        add("seek_forward_30",  lambda: self._seek_rel(30_000))
+        add("seek_back_30",     lambda: self._seek_rel(-30_000))
+        add("vol_up",           lambda: self._vol_delta(5))
+        add("vol_down",         lambda: self._vol_delta(-5))
+        add("bm_prev",          lambda: self._jump_adjacent_bookmark(-1))
+        add("bm_next",          lambda: self._jump_adjacent_bookmark(1))
         for i in range(1, 10):
-            sc(f"Alt+{i}", lambda n=i: self._jump_to_bookmark(n - 1))
-        # 搜索 / 截图 / 打开
-        sc("Ctrl+F",      self._toggle_search)
-        sc("/",           self._toggle_search)
-        sc("Ctrl+S",      self._take_screenshot)
-        sc("Ctrl+Shift+S", self._quick_screenshot)
-        sc("Ctrl+O",      self.open_file)
-        sc("Ctrl+Shift+O", self.open_folder)
-        # 跳转指定时间
-        sc("Ctrl+G",      self._jump_to_time)
-        # 字幕
-        sc("Ctrl+L",      self._toggle_subtitles)
-        sc("Ctrl+Shift+L", self._load_subtitle_file)
+            sc = QShortcut(QKeySequence(f"Alt+{i}"), self,
+                           activated=lambda n=i: self._jump_to_bookmark(n - 1))
+            self._shortcuts.append(sc)
+        add("search",           self._toggle_search)
+        add("screenshot",       self._take_screenshot)
+        add("quick_screenshot", self._quick_screenshot)
+        add("open_file",        self.open_file)
+        add("open_folder",      self.open_folder)
+        add("jump_to_time",     self._jump_to_time)
+        add("toggle_subtitle",  self._toggle_subtitles)
+        add("load_subtitle",    self._load_subtitle_file)
+        # 窗口大小
+        add("size_50",          lambda: self._set_window_size(0.5))
+        add("size_100",         lambda: self._set_window_size(1.0))
+        add("size_200",         lambda: self._set_window_size(2.0))
+        add("size_native",      lambda: self._set_window_size(0))
+        # 设置
+        add("settings",         self._show_settings)
+        # "/" 也作为搜索快捷键（固定，不可配置）
+        self._shortcuts.append(QShortcut(QKeySequence("/"), self, activated=self._toggle_search))
 
     # ── 信号连接 ──────────────────────────────────────────────────────────────
     def _wire_signals(self):
@@ -1457,6 +1726,38 @@ class PlayerWindow(QMainWindow):
         if self.isFullScreen():
             self.toggle_fullscreen()
 
+    # ── 窗口大小快捷设置 ──────────────────────────────────────────────────────
+    def _set_window_size(self, scale: float):
+        """scale: 0.5=50%, 1.0=100%, 2.0=200%, 0=原始视频尺寸"""
+        if self.isFullScreen():
+            self.showNormal()
+        # 视频原始尺寸
+        vw = self.video.size().width()
+        vh = self.video.size().height()
+        if scale == 0:
+            # 原始尺寸：用视频帧的实际尺寸（若可用）
+            frame = self.video_sink.videoFrame()
+            if frame and frame.isValid():
+                vw = frame.width()
+                vh = frame.height()
+        else:
+            # 基于当前窗口尺寸缩放
+            w = self.width()
+            h = self.height()
+            vw = int(w * scale)
+            vh = int(h * scale)
+        if vw <= 0 or vh <= 0:
+            return
+        # 确保不超出屏幕
+        screen = self.screen()
+        if screen:
+            avail = screen.availableGeometry()
+            vw = min(vw, avail.width())
+            vh = min(vh, avail.height())
+        self.resize(vw, vh)
+        label = "原始尺寸" if scale == 0 else f"{int(scale*100)}%"
+        self._show_osd(f"🪟 窗口 {label}")
+
     def _is_sidebar_visible(self) -> bool:
         return self.splitter.sizes()[0] > 0
 
@@ -1705,6 +2006,8 @@ class PlayerWindow(QMainWindow):
 
     # ── OSD 叠层提示 ──────────────────────────────────────────────────────────
     def _show_osd(self, text: str):
+        if not self._dm.get_setting("show_osd", True):
+            return
         self._osd.setText(text)
         self._osd.adjustSize()
         content = self._osd.parent()
@@ -2096,6 +2399,14 @@ class PlayerWindow(QMainWindow):
         fs_txt = "⛶  退出全屏" if self.isFullScreen() else "⛶  全屏"
         menu.addAction(fs_txt).triggered.connect(self.toggle_fullscreen)
 
+        # 窗口大小子菜单
+        size_menu = menu.addMenu("🪟  窗口大小")
+        size_menu.setStyleSheet(menu.styleSheet())
+        size_menu.addAction("50%  [Ctrl+1]").triggered.connect(lambda: self._set_window_size(0.5))
+        size_menu.addAction("100%  [Ctrl+2]").triggered.connect(lambda: self._set_window_size(1.0))
+        size_menu.addAction("200%  [Ctrl+3]").triggered.connect(lambda: self._set_window_size(2.0))
+        size_menu.addAction("原始尺寸  [Ctrl+0]").triggered.connect(lambda: self._set_window_size(0))
+
         menu.addSeparator()
 
         # 书签
@@ -2122,6 +2433,10 @@ class PlayerWindow(QMainWindow):
         io_menu.setStyleSheet(menu.styleSheet())
         io_menu.addAction("导入 M3U…").triggered.connect(self._import_m3u)
         io_menu.addAction("导出 M3U…").triggered.connect(self._export_m3u)
+
+        # 设置
+        menu.addSeparator()
+        menu.addAction("⚙  设置…  [Ctrl+,]").triggered.connect(self._show_settings)
 
         menu.exec(self.video.mapToGlobal(pos))
 
@@ -2563,30 +2878,41 @@ class PlayerWindow(QMainWindow):
             f"<p style='color:#888;'>© 2026 Video Player</p>"
         )
 
-    def _show_shortcuts_help(self):
-        shortcuts = (
-            "<h3>快捷键说明</h3>"
-            "<table>"
-            "<tr><td>Space</td><td>播放 / 暂停</td></tr>"
-            "<tr><td>M</td><td>添加书签</td></tr>"
-            "<tr><td>P</td><td>显示 / 隐藏 侧边栏</td></tr>"
-            "<tr><td>F / 双击</td><td>全屏切换</td></tr>"
-            "<tr><td>← / →</td><td>快退 / 快进 5 秒</td></tr>"
-            "<tr><td>Shift+← / →</td><td>快退 / 快进 30 秒</td></tr>"
-            "<tr><td>↑ / ↓</td><td>音量 +5 / -5</td></tr>"
-            "<tr><td>N / B</td><td>下一个 / 上一个</td></tr>"
-            "<tr><td>滚轮</td><td>快进 / 快退 5 秒</td></tr>"
-            "<tr><td>Ctrl+G</td><td>跳转到指定时间</td></tr>"
-            "<tr><td>[ / ]</td><td>上一个 / 下一个书签</td></tr>"
-            "<tr><td>Ctrl+L</td><td>显示 / 隐藏字幕</td></tr>"
-            "<tr><td>Ctrl+Shift+L</td><td>加载字幕文件</td></tr>"
-            "<tr><td>Ctrl+S</td><td>截图</td></tr>"
-            "<tr><td>Ctrl+Shift+S</td><td>快速截图</td></tr>"
-            "<tr><td>Ctrl+F / /</td><td>搜索播放列表</td></tr>"
-            "<tr><td>Ctrl+O</td><td>打开文件</td></tr>"
-            "<tr><td>Ctrl+Shift+O</td><td>打开文件夹</td></tr>"
-            "</table>"
+    def _show_settings(self):
+        """打开设置对话框，保存后应用通用设置和快捷键"""
+        dlg = SettingsDialog(self._dm, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        settings, shortcuts = dlg.get_values()
+        # 保存通用设置
+        for k, v in settings.items():
+            self._dm.set_setting(k, v)
+        # 保存快捷键
+        self._dm.set_shortcuts(shortcuts)
+        # 应用：重建快捷键
+        self._build_shortcuts()
+        # 应用：字幕字号
+        sub_size = settings.get("subtitle_font_size", 22)
+        self._subtitle_label.setStyleSheet(
+            f"color: #ffffff; font-size: {sub_size}px; font-weight: bold;"
+            " background: transparent; padding: 0 12px 24px 12px;"
+            " font-family: 'Microsoft YaHei','SimHei',sans-serif;"
         )
+        self._show_osd("⚙ 设置已保存")
+
+    def _show_shortcuts_help(self):
+        rows = []
+        for action_id, (default_key, desc, _) in SHORTCUT_DEFAULTS.items():
+            key = self._dm.get_shortcut(action_id)
+            if not key:
+                key = "（已禁用）"
+            rows.append(f"<tr><td>{key}</td><td>{desc}</td></tr>")
+        # 固定快捷键
+        rows.append("<tr><td>Alt+1~9</td><td>跳转到第 1-9 个书签</td></tr>")
+        rows.append("<tr><td>/</td><td>搜索播放列表</td></tr>")
+        rows.append("<tr><td>滚轮</td><td>快进 / 快退 5 秒</td></tr>")
+        rows.append("<tr><td>双击</td><td>全屏切换</td></tr>")
+        shortcuts = "<h3>快捷键说明</h3><table>" + "".join(rows) + "</table>"
         QMessageBox.about(self, "快捷键说明", shortcuts)
 
     # ── M3U 播放列表导入/导出 ────────────────────────────────────────────────
@@ -2640,6 +2966,13 @@ class PlayerWindow(QMainWindow):
             self._show_osd(f"导出失败: {e}")
 
     # ── 截图 ─────────────────────────────────────────────────────────────────
+    def _get_screenshot_dir(self) -> str:
+        """返回截图保存目录（设置中配置的目录，或默认 图片 文件夹）"""
+        d = self._dm.get_setting("screenshot_dir", "")
+        if d and os.path.isdir(d):
+            return d
+        return str(Path.home() / "Pictures")
+
     def _take_screenshot(self):
         if self.current_index < 0:
             return
@@ -2647,7 +2980,7 @@ class PlayerWindow(QMainWindow):
         if pixmap is None or pixmap.isNull():
             self._show_osd("截图失败：无法获取视频帧")
             return
-        screenshots_dir = str(Path.home() / "Pictures")
+        screenshots_dir = self._get_screenshot_dir()
         os.makedirs(screenshots_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         default_name = os.path.join(screenshots_dir, f"screenshot_{ts}.png")
@@ -2668,7 +3001,7 @@ class PlayerWindow(QMainWindow):
         if pixmap is None or pixmap.isNull():
             self._show_osd("截图失败：无法获取视频帧")
             return
-        screenshots_dir = str(Path.home() / "Pictures")
+        screenshots_dir = self._get_screenshot_dir()
         os.makedirs(screenshots_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         file_path = os.path.join(screenshots_dir, f"screenshot_{ts}.png")
